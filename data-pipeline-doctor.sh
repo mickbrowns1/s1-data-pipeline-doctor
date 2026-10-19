@@ -3718,6 +3718,47 @@ _dp_listener_status() {
     fi
 }
 
+# Detect whether $DOCKER_CONTAINER was created by Docker Compose, and if so,
+# which compose file it came from. Reads Compose's own labels rather than
+# assuming a path (~/docker-compose-observo.yml) — the file may have been
+# renamed, moved, or never existed under that name. Sets DP_COMPOSE_FILE on
+# success; returns 1 if not Compose-managed or the file is no longer there.
+_dp_compose_info() {
+    local cfgfiles
+    cfgfiles=$(dinspect '{{index .Config.Labels "com.docker.compose.project.config_files"}}')
+    [[ -z "$cfgfiles" || "$cfgfiles" == "<no value>" ]] && return 1
+    DP_COMPOSE_FILE="${cfgfiles%%,*}"   # config_files can be comma-separated; take the first
+    [[ -f "$DP_COMPOSE_FILE" ]] || return 1
+    return 0
+}
+
+# Add a "-p"-style port mapping to a Compose file's service, so a future
+# `docker compose up -d` doesn't silently drop ports added via this menu.
+# Creates the `ports:` key if it's missing; idempotent (skips if the exact
+# mapping is already present). Assumes the single-service layout this tool
+# generates (2-space service indent, 4-space key indent under it).
+_dp_compose_add_port() {
+    local file="$1" newmap="$2"
+    if grep -qF "\"${newmap}\"" "$file"; then
+        return 0   # already present
+    fi
+    if grep -qE '^[[:space:]]*ports:[[:space:]]*$' "$file"; then
+        awk -v newmap="$newmap" '
+            { print }
+            /^[[:space:]]*ports:[[:space:]]*$/ { print "      - \"" newmap "\"" }
+        ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+    else
+        awk -v newmap="$newmap" '
+            { print }
+            /^[[:space:]]*container_name:/ && !done {
+                print "    ports:"
+                print "      - \"" newmap "\""
+                done=1
+            }
+        ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+    fi
+}
+
 # Reconstruct the `docker run` argv for the current container, adding extra -p
 # mappings ($@). Sets globals DP_RUN_CMD (array) and DP_ENV_FILE. Env is written
 # to a 0600 --env-file (HOSTNAME dropped so Docker assigns a fresh one) — secrets
@@ -3823,39 +3864,77 @@ docker_menu_source_ports() {
     echo ""
 
     local act
+    local compose_file=""
+    if _dp_compose_info; then
+        compose_file="$DP_COMPOSE_FILE"
+        log_info "This site is managed by Docker Compose (${compose_file})."
+        echo -e "  ${DIM}The port will be added there too, so a future 'docker compose up -d' doesn't drop it.${NC}"
+        echo ""
+    fi
+
     act=$(pick_one "How do you want to proceed?" \
         "Show the recreate command (I'll run it myself)" \
         "Recreate the container now (confirm first)" \
         "Back")
     case "$act" in
         1)
-            _dp_build_run_cmd "$newmap"
-            echo ""
-            echo -e "  ${DIM}Env written to ${DP_ENV_FILE} (chmod 600 — contains secrets).${NC}"
-            echo -e "  ${BOLD}Recreate command:${NC}"
-            echo ""
-            echo "    docker stop $DOCKER_CONTAINER && docker rename $DOCKER_CONTAINER ${DOCKER_CONTAINER}_old && \\"
-            printf '    '; printf '%q ' "${DP_RUN_CMD[@]}"; echo
-            echo ""
-            echo -e "  ${DIM}Rollback if needed: docker rm -f $DOCKER_CONTAINER; docker rename ${DOCKER_CONTAINER}_old $DOCKER_CONTAINER; docker start $DOCKER_CONTAINER${NC}"
+            if [[ -n "$compose_file" ]]; then
+                echo ""
+                echo -e "  ${BOLD}Recreate command:${NC}"
+                echo ""
+                echo "    cp ${compose_file} ${compose_file}.bak   # backup first"
+                echo "    # then add under the service's 'ports:' list (create it if missing):"
+                echo "    #   - \"${newmap}\""
+                echo "    docker compose -f ${compose_file} up -d"
+                echo ""
+                echo -e "  ${DIM}Rollback if needed: cp ${compose_file}.bak ${compose_file} && docker compose -f ${compose_file} up -d${NC}"
+            else
+                _dp_build_run_cmd "$newmap"
+                echo ""
+                echo -e "  ${DIM}Env written to ${DP_ENV_FILE} (chmod 600 — contains secrets).${NC}"
+                echo -e "  ${BOLD}Recreate command:${NC}"
+                echo ""
+                echo "    docker stop $DOCKER_CONTAINER && docker rename $DOCKER_CONTAINER ${DOCKER_CONTAINER}_old && \\"
+                printf '    '; printf '%q ' "${DP_RUN_CMD[@]}"; echo
+                echo ""
+                echo -e "  ${DIM}Rollback if needed: docker rm -f $DOCKER_CONTAINER; docker rename ${DOCKER_CONTAINER}_old $DOCKER_CONTAINER; docker start $DOCKER_CONTAINER${NC}"
+            fi
             pause ;;
         2)
-            _dp_build_run_cmd "$newmap"
-            echo ""
-            echo -e "  ${YELLOW}This will stop and recreate ${DOCKER_CONTAINER} (~brief downtime).${NC}"
-            echo -e "  ${DIM}The current container is renamed (not deleted) so you can roll back.${NC}"
-            if ! confirm "Recreate $DOCKER_CONTAINER now with -p ${newmap}?"; then pause; return; fi
-            local backup="${DOCKER_CONTAINER}_pre$(date +%s)"
-            if ! docker stop "$DOCKER_CONTAINER" >/dev/null 2>&1; then log_err "Failed to stop container"; pause; return; fi
-            if ! docker rename "$DOCKER_CONTAINER" "$backup" >/dev/null 2>&1; then log_err "Failed to rename; container is stopped — start it again with: docker start $DOCKER_CONTAINER"; pause; return; fi
-            if "${DP_RUN_CMD[@]}" >/dev/null 2>&1; then
-                log_fix "Recreated $DOCKER_CONTAINER with -p ${newmap}. Backup: $backup"
-                echo -e "  ${DIM}Verify, then remove the backup: docker rm $backup${NC}"
+            if [[ -n "$compose_file" ]]; then
+                echo ""
+                echo -e "  ${YELLOW}This will update ${compose_file} and recreate ${DOCKER_CONTAINER} via Compose (~brief downtime).${NC}"
+                if ! confirm "Add -p ${newmap} to ${compose_file} and run 'docker compose up -d' now?"; then pause; return; fi
+                if ! cp "$compose_file" "${compose_file}.bak"; then
+                    log_err "Could not back up ${compose_file} — aborting."; pause; return
+                fi
+                _dp_compose_add_port "$compose_file" "$newmap"
+                if docker compose -f "$compose_file" up -d >/dev/null 2>&1; then
+                    log_fix "Updated ${compose_file} and recreated $DOCKER_CONTAINER with -p ${newmap}."
+                    echo -e "  ${DIM}Previous file saved as ${compose_file}.bak${NC}"
+                else
+                    log_err "docker compose up failed — restoring the previous ${compose_file}"
+                    cp "${compose_file}.bak" "$compose_file"
+                    docker compose -f "$compose_file" up -d >/dev/null 2>&1
+                fi
             else
-                log_err "Recreate failed — rolling back to the previous container"
-                docker rm -f "$DOCKER_CONTAINER" >/dev/null 2>&1
-                docker rename "$backup" "$DOCKER_CONTAINER" >/dev/null 2>&1
-                docker start "$DOCKER_CONTAINER" >/dev/null 2>&1 && log_info "Rolled back; original container is running again."
+                _dp_build_run_cmd "$newmap"
+                echo ""
+                echo -e "  ${YELLOW}This will stop and recreate ${DOCKER_CONTAINER} (~brief downtime).${NC}"
+                echo -e "  ${DIM}The current container is renamed (not deleted) so you can roll back.${NC}"
+                if ! confirm "Recreate $DOCKER_CONTAINER now with -p ${newmap}?"; then pause; return; fi
+                local backup="${DOCKER_CONTAINER}_pre$(date +%s)"
+                if ! docker stop "$DOCKER_CONTAINER" >/dev/null 2>&1; then log_err "Failed to stop container"; pause; return; fi
+                if ! docker rename "$DOCKER_CONTAINER" "$backup" >/dev/null 2>&1; then log_err "Failed to rename; container is stopped — start it again with: docker start $DOCKER_CONTAINER"; pause; return; fi
+                if "${DP_RUN_CMD[@]}" >/dev/null 2>&1; then
+                    log_fix "Recreated $DOCKER_CONTAINER with -p ${newmap}. Backup: $backup"
+                    echo -e "  ${DIM}Verify, then remove the backup: docker rm $backup${NC}"
+                else
+                    log_err "Recreate failed — rolling back to the previous container"
+                    docker rm -f "$DOCKER_CONTAINER" >/dev/null 2>&1
+                    docker rename "$backup" "$DOCKER_CONTAINER" >/dev/null 2>&1
+                    docker start "$DOCKER_CONTAINER" >/dev/null 2>&1 && log_info "Rolled back; original container is running again."
+                fi
             fi
             pause ;;
         *) return ;;

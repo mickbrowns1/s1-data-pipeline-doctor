@@ -3124,11 +3124,24 @@ docker_fix_oom() {
     new=$(( mem * 3 / 2 ))
     echo "    Current: $(human_bytes "$mem")  →  Proposed: $(human_bytes "$new")"
     if confirm "Bump container memory limit to $(human_bytes "$new") via 'docker update'?"; then
+        local compose_file=""
+        _dp_compose_info && compose_file="$DP_COMPOSE_FILE"
+
         if docker update --memory "$new" --memory-swap "$new" "$DOCKER_CONTAINER" 2>/dev/null; then
-            log_fix "Memory limit updated to $(human_bytes "$new")"; return 0
+            log_fix "Memory limit updated to $(human_bytes "$new")"
+            if [[ -n "$compose_file" ]]; then
+                _dp_compose_set_mem_limit "$compose_file" "$new" "$new"
+                log_info "Also updated ${compose_file} so this survives a future recreate."
+            fi
+            return 0
         fi
         if docker update --memory "$new" "$DOCKER_CONTAINER" 2>/dev/null; then
-            log_fix "Memory limit updated to $(human_bytes "$new") (swap unchanged)"; return 0
+            log_fix "Memory limit updated to $(human_bytes "$new") (swap unchanged)"
+            if [[ -n "$compose_file" ]]; then
+                _dp_compose_set_mem_limit "$compose_file" "$new" ""
+                log_info "Also updated ${compose_file} so this survives a future recreate."
+            fi
+            return 0
         fi
         log_err "docker update failed — recreate the container with: --memory $(human_bytes "$new")"
     fi
@@ -3753,6 +3766,48 @@ _dp_compose_add_port() {
             /^[[:space:]]*container_name:/ && !done {
                 print "    ports:"
                 print "      - \"" newmap "\""
+                done=1
+            }
+        ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+    fi
+}
+
+# Set (or add) a Compose file's mem_limit / memswap_limit keys, mirroring a
+# live `docker update --memory` bump. Without this, the file keeps saying
+# "unlimited" and a future `docker compose up -d` — for any reason, not just
+# another OOM fix — silently reverts the bump on recreate. memswap may be
+# empty to only touch mem_limit (matches the docker update fallback path
+# that only bumps --memory, not --memory-swap).
+_dp_compose_set_mem_limit() {
+    local file="$1" mem="$2" memswap="$3"
+
+    if grep -qE '^[[:space:]]*mem_limit:' "$file"; then
+        awk -v mem="$mem" '
+            /^[[:space:]]*mem_limit:/ { sub(/mem_limit:.*/, "mem_limit: " mem) }
+            { print }
+        ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+    else
+        awk -v mem="$mem" '
+            { print }
+            /^[[:space:]]*container_name:/ && !done {
+                print "    mem_limit: " mem
+                done=1
+            }
+        ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+    fi
+
+    [[ -z "$memswap" ]] && return 0
+
+    if grep -qE '^[[:space:]]*memswap_limit:' "$file"; then
+        awk -v ms="$memswap" '
+            /^[[:space:]]*memswap_limit:/ { sub(/memswap_limit:.*/, "memswap_limit: " ms) }
+            { print }
+        ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+    else
+        awk -v ms="$memswap" '
+            { print }
+            /^[[:space:]]*mem_limit:/ && !done {
+                print "    memswap_limit: " ms
                 done=1
             }
         ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"

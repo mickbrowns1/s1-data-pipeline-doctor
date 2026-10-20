@@ -6,7 +6,7 @@
 
 Interactive diagnostic and remediation tool for Singularity Data Pipeline site installations — supports both **Kubernetes/K3s** sites and **Docker standalone** sites.
 
-Built by Justin.Hamblin@SentinelOne.com
+Built by SentinelOne Architecture Team
 
 ## Quick Start
 

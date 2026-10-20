@@ -268,7 +268,7 @@ banner() {
     clear
     echo ""
     echo -e "  ${BOLD}${PURPLE}S1 DATA PIPELINES${NC} ${DIM}·${NC} ${BOLD}${CYAN}Doctor${NC} ${DIM}v1.6${NC}    ${CYAN}♥${NC}"
-    echo -e "  ${DIM}K8s + Docker site diagnostics · Justin.Hamblin@SentinelOne.com${NC}"
+    echo -e "  ${DIM}K8s + Docker site diagnostics · Built by SentinelOne Architecture Team${NC}"
     hr
     echo ""
 }

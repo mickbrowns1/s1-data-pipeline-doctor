@@ -3195,10 +3195,19 @@ docker_fix_wef_checkpoint_store() {
 
     mkdir -p "$(dirname "$hostfile")" 2>/dev/null
     cat > "$hostfile" <<'EOF'
+# Lab workaround: checkpoint store for the dataplane instance (WEF source needs one).
+# Mirrors /etc/collector-globals/collector-globals.yaml, with a separate db file.
 data_dir: /var/observo/data/dataplane
 checkpoint:
   store_path: /var/observo/data/dataplane/checkpoints.db3
 EOF
+    # The container reads this as uid 1000. A host-written file can come out
+    # unreadable to it depending on the host user's uid (confirmed live: the
+    # same class of failure hit cert files mounted the same way, on a host
+    # where the invoking user wasn't uid 1000). Nothing here is a secret, so
+    # make it world-readable rather than trying to chown to a uid that may
+    # not even exist as a real user on this host.
+    chmod 644 "$hostfile" 2>/dev/null
 
     local compose_file=""
     _dp_compose_info && compose_file="$DP_COMPOSE_FILE"

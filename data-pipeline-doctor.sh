@@ -413,7 +413,7 @@ main_menu() {
         echo -e "    ${CYAN} 0)${NC} Exit"
         echo ""
         local choice
-        read -rp "  Choose [0-13]: " choice
+        read -rp "  Choose [0-13]: " choice || { echo ""; log_info "Goodbye."; exit 0; }
 
         case "$choice" in
             1)  full_scan ;;
@@ -2950,7 +2950,7 @@ docker_scan_tls() {
     fi
 
     [[ ${#DOCKER_ENDPOINTS[@]} -eq 0 ]] && log_warn "No endpoints derived from container env"
-    local hp host port result issuer
+    local hp host port result issuer container_ok
     for hp in "${DOCKER_ENDPOINTS[@]:-}"; do
         [[ -z "$hp" ]] && continue
         host="${hp%%:*}"; port="${hp##*:}"
@@ -2960,8 +2960,20 @@ docker_scan_tls() {
             issuer=$(echo "$result" | grep "issuer=" | head -1 | sed 's/.*CN *= *//')
             log_ok "TLS $hp — issued by ${issuer:-unknown}"
         else
-            log_err "TLS $hp — verification failed from host"
-            add_issue "tls-host: Cannot verify $host from host"
+            # The host may simply lack this endpoint's name/network path (a
+            # lab-only hostname, a container-only network, etc.) while the
+            # site itself — which runs entirely inside the container — is
+            # fine. Check from inside the container before treating this as
+            # a real issue, same reasoning as the DNS check below.
+            container_ok=false
+            dexec sh -c "openssl s_client -connect '$hp' -servername '$host' </dev/null 2>&1" 2>/dev/null \
+                | grep -q "verify return:1" && container_ok=true
+            if $container_ok; then
+                log_warn "TLS $hp — verification failed from the host, but the container verifies it fine. Likely a host-only DNS/network gap, not a site problem."
+            else
+                log_err "TLS $hp — verification failed from host and from inside the container"
+                add_issue "tls-host: Cannot verify $host"
+            fi
         fi
     done
 
@@ -2981,22 +2993,32 @@ docker_scan_dns() {
     if [[ ${#DOCKER_ENDPOINTS[@]} -eq 0 ]]; then
         log_warn "No endpoints to resolve"; return
     fi
-    local seen=() hp host
+    local seen=() hp host container_ok
     for hp in "${DOCKER_ENDPOINTS[@]}"; do
         host="${hp%%:*}"
         _in_list "$host" "${seen[@]:-}" && continue
         seen+=("$host")
+
+        # Check the container first: it's what actually runs the site. The
+        # host may use a different resolver/network path entirely (a
+        # lab-only hostname, a container-only network) and simply not have
+        # this name — that's not a site problem if the container resolves it.
+        if dexec getent hosts "$host" >/dev/null 2>&1; then
+            container_ok=true
+            log_ok "Container resolves: $host"
+        else
+            container_ok=false
+            log_warn "Container cannot resolve: $host"
+            add_issue "dns: container cannot resolve $host"
+        fi
+
         if nslookup "$host" &>/dev/null || dig +short "$host" 2>/dev/null | grep -q .; then
             log_ok "Host resolves: $host"
+        elif $container_ok; then
+            log_warn "Host cannot resolve $host, but the container resolves it fine. Likely a host-only DNS gap, not a site problem."
         else
             log_err "Host cannot resolve: $host"
             add_issue "dns: Cannot resolve $host from host"
-        fi
-        if dexec getent hosts "$host" >/dev/null 2>&1; then
-            log_ok "Container resolves: $host"
-        else
-            log_warn "Container cannot resolve: $host"
-            add_issue "dns: container cannot resolve $host"
         fi
     done
 }
@@ -3181,7 +3203,7 @@ docker_fix_wef_checkpoint_store() {
     echo "    SentinelOne for your version before relying on it in production."
     echo ""
 
-    local hostfile="$HOME/.data-pipeline-doctor/dataplane-globals.yaml"
+    local hostfile="$(_dpd_home)/.data-pipeline-doctor/dataplane-globals.yaml"
     echo "    Will write $hostfile:"
     echo -e "      ${DIM}data_dir: /var/observo/data/dataplane${NC}"
     echo -e "      ${DIM}checkpoint:${NC}"
@@ -3208,23 +3230,30 @@ EOF
     # make it world-readable rather than trying to chown to a uid that may
     # not even exist as a real user on this host.
     chmod 644 "$hostfile" 2>/dev/null
+    # Under sudo, root wrote this into the real user's home (_dpd_home) —
+    # give it back to them so it's not a root-owned file sitting in their
+    # own home directory.
+    if [[ ${EUID:-$(id -u)} -eq 0 && -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+        chown "$SUDO_USER" "$hostfile" "$(dirname "$hostfile")" 2>/dev/null
+    fi
 
     local compose_file=""
     _dp_compose_info && compose_file="$DP_COMPOSE_FILE"
 
     if [[ -n "$compose_file" ]]; then
-        if ! cp "$compose_file" "${compose_file}.bak"; then
+        local compose_backup="${compose_file}.bak.$(date +%Y%m%d%H%M%S)"
+        if ! cp "$compose_file" "$compose_backup"; then
             log_err "Could not back up ${compose_file} — aborting."
             return 1
         fi
         _dp_compose_add_mount "$compose_file" "$hostfile" "$mount_dst" "ro"
         if docker compose -f "$compose_file" up -d >/dev/null 2>&1; then
             log_fix "Mounted $hostfile at ${mount_dst} and recreated $DOCKER_CONTAINER."
-            log_info "Also updated ${compose_file} (backup: ${compose_file}.bak) so this survives a future recreate."
+            log_info "Also updated ${compose_file} (backup: ${compose_backup}) so this survives a future recreate."
             return 0
         fi
         log_err "docker compose up failed — restoring the previous ${compose_file}"
-        cp "${compose_file}.bak" "$compose_file"
+        cp "$compose_backup" "$compose_file"
         docker compose -f "$compose_file" up -d >/dev/null 2>&1
         return 1
     fi
@@ -4341,7 +4370,7 @@ docker_main_menu() {
         echo -e "    ${CYAN} 0)${NC} Exit"
         echo ""
         local choice
-        read -rp "  Choose [0-14]: " choice
+        read -rp "  Choose [0-14]: " choice || { echo ""; log_info "Goodbye."; exit 0; }
         case "$choice" in
             1)  docker_full_scan ;;
             2)  docker_run_scan docker_scan_services "Service Health (s6)" ;;

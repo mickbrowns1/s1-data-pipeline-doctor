@@ -134,6 +134,28 @@ Option **15 → WEF/WEC integration**:
 
 1. **Readiness check (read-only).** Reports OK/WARN/FAIL for: WEF source found (listen address, callback), port published on the host, checkpoint store mounted, certificate files readable inside the container by uid 1000, crypto mode (flags FIPS as incompatible with WEF on image 2.46.0), the last WEF error seen in logs, and forwarders seen recently.
 2. **Make this site WEF-ready.** Diagnoses what's missing, shows the plan, and applies everything in **one recreate**: writes and mounts the checkpoint store, mounts your certificate files at the path the console source expects (asks where they currently live on the host — Doctor can't guess this), and disables FIPS-mode crypto if it's on (with its own explicit warning and confirmation, since that affects the whole site, not just WEF). Backs up the Compose file with a timestamped name first.
+3. **Windows forwarder setup.** Prints what each Windows forwarder needs, built from this site's values: the collector address, the CA thumbprint, and the exact subscription manager string (`Server=HTTPS://<host>:<port>/wsman/SubscriptionManager/WEC,Refresh=60,IssuerCA=<thumbprint>`). It covers both the GPO path and the registry value. It can also write `wef-forwarder-setup.ps1` to your home folder. The script is safe to re-run on a forwarder that's already set up (`-PfxPath`/`-CaPath` are optional). It:
+   - imports the CA and client certificate,
+   - grants NETWORK SERVICE read on the client key,
+   - adds NETWORK SERVICE to Event Log Readers,
+   - sets WinRM to Automatic,
+   - writes the subscription manager value,
+   - restarts WinRM,
+   - shows the Forwarding/Operational log.
+4. **TLS endpoint test.** It checks:
+   - that the server certificate covers the callback host (SAN),
+   - that it verifies against the configured CA, and that the key matches,
+   - expiry and the Server Authentication EKU,
+   - a real TLS handshake on the container port, verified against the CA,
+   - that the published host port accepts connections,
+   - what the callback host resolves to.
+
+   It uses the container's OpenSSL, since many hosts have none.
+5. **Forwarder activity.** Summarizes the last N hours of WEF logs:
+   - connections and last-seen time per forwarder, named by client-certificate CN,
+   - events received in total and per hour,
+   - TLS handshake failures by cause, with the normal Windows ones labelled as normal,
+   - recent WEF errors.
 
 > Three product gaps drive this: the dataplane has no default checkpoint store (WEF needs one to persist bookmarks), certificate files must be readable by the container's uid 1000, and WEF cannot build its TLS identity on image 2.46.0 with FIPS-mode crypto enabled. All three are confirmed against a real Docker standalone site, not just vendor documentation.
 

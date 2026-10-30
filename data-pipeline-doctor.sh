@@ -4877,6 +4877,341 @@ docker_wef_make_ready() {
     return 0
 }
 
+# --- WEF/WEC tools: forwarder setup, TLS test, forwarder activity ---------
+# The host often has no openssl (minimal Fedora/RHEL), so certificate work
+# runs inside the container, whose image ships OpenSSL 3.
+
+_dp_wef_ssl() { dexec openssl "$@" 2>/dev/null; }
+
+# Host port published for the WEF listener's container port (empty if none).
+_dp_wef_host_port() {
+    local cport="${DP_WEF_LISTEN##*:}" hp hport cp2
+    while IFS='|' read -r hp hport cp2; do
+        [[ "${cp2%%/*}" == "$cport" ]] && { echo "$hport"; return; }
+    done < <(dinspect '{{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostIp}}|{{.HostPort}}|{{$p}}{{println}}{{end}}{{end}}')
+}
+
+# SHA-1 thumbprint of the WEF CA, as Windows wants it in IssuerCA= (no colons,
+# upper case). Falls back to the one the WEF source logs at startup.
+_dp_wef_ca_thumbprint() {
+    local ca="" p t
+    for p in "${DP_WEF_CERT_PATHS[@]:-}"; do [[ "$p" == *ca* ]] && { ca="$p"; break; }; done
+    if [[ -n "$ca" ]]; then
+        t=$(_dp_wef_ssl x509 -in "$ca" -noout -fingerprint -sha1 | sed 's/.*=//; s/://g')
+    fi
+    [[ -z "$t" ]] && t=$(dk logs "$DOCKER_CONTAINER" --tail 2000 2>&1 | grep -oE 'Computed CA thumbprint: [A-Fa-f0-9]{40}' | tail -1 | awk '{print $NF}')
+    echo "$t" | tr 'a-f' 'A-F'
+}
+
+# Which of DP_WEF_CERT_PATHS is the CA / server cert / key (by key name order
+# from the config: ca_file, crt_file, key_file — fall back on file names).
+_dp_wef_cert_roles() {
+    DP_WEF_CA="" DP_WEF_CRT="" DP_WEF_KEY=""
+    local p
+    for p in "${DP_WEF_CERT_PATHS[@]:-}"; do
+        case "$p" in
+            *.key|*key*.pem) DP_WEF_KEY="$p" ;;
+            *ca*)            DP_WEF_CA="$p" ;;
+            *)               DP_WEF_CRT="$p" ;;
+        esac
+    done
+}
+
+docker_wef_forwarder_setup() {
+    banner
+    echo -e "  ${BOLD}Windows forwarder setup — $DOCKER_CONTAINER${NC}"
+    echo -e "  ${DIM}What to configure on each Windows host that forwards events to this site.${NC}"
+    echo ""
+    _dp_wef_read_config
+    if ! $DP_WEF_FOUND; then
+        log_err "No WEF source in this site's pipeline yet — add it in the console first."
+        pause; return
+    fi
+    local cb="$DP_WEF_CALLBACK" host port thumb
+    host="${cb%:*}"; port="${cb##*:}"
+    thumb="$(_dp_wef_ca_thumbprint)"
+    if [[ -z "$cb" || "$host" == "$cb" ]]; then
+        log_err "The WEF source has no collector (callback) address — set it in the console source first."
+        pause; return
+    fi
+    local sub="Server=HTTPS://${host}:${port}/wsman/SubscriptionManager/WEC,Refresh=60,IssuerCA=${thumb:-<CA thumbprint>}"
+
+    echo -e "  ${BOLD}Values for this site${NC}"
+    echo "    Collector address:   ${host}:${port}"
+    echo "    CA thumbprint:       ${thumb:-(could not read — check the CA file is readable, Tools 15 → 1)}"
+    echo "    Subscription manager:"
+    echo -e "      ${CYAN}${sub}${NC}"
+    echo ""
+    echo -e "  ${BOLD}On each Windows forwarder (elevated PowerShell)${NC}"
+    echo "    1. ${host} must resolve to this host (DNS, or a hosts-file entry for a lab)."
+    echo "    2. Import the CA into Local Computer → Trusted Root Certification Authorities."
+    echo "    3. Import a client certificate (.pfx, Client Authentication EKU, issued by that CA)"
+    echo "       into Local Computer → Personal, and grant NETWORK SERVICE read on its private key."
+    echo "    4. Add NETWORK SERVICE to the 'Event Log Readers' group (needed for the Security log)."
+    echo "    5. Set WinRM to Automatic and start it."
+    echo "    6. Set the subscription manager to the value above:"
+    echo "         GPO: Computer Configuration → Administrative Templates → Windows Components →"
+    echo "              Event Forwarding → Configure target Subscription Manager"
+    echo "         or, without a domain, the registry value it writes:"
+    echo "         HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\EventLog\\EventForwarding\\SubscriptionManager  1 = <value>"
+    echo "    7. Restart WinRM, then check Event Viewer → Applications and Services Logs →"
+    echo "       Microsoft → Windows → Forwarding → Operational: 104 = connected, 105 = error."
+    echo ""
+
+    local out
+    out="$(_dpd_home)/wef-forwarder-setup.ps1"
+    if confirm "Write these steps as a PowerShell script to ${out}?"; then
+        _dp_wef_write_forwarder_ps1 "$out" "$host" "$port" "$thumb"
+        _dpd_chown_back "$out"
+        log_ok "Wrote $out"
+        echo -e "  ${DIM}Copy it to a forwarder and run in an elevated PowerShell:${NC}"
+        # printf, not echo -e: "\c" in ".\client.pfx" would end echo -e's output.
+        printf '    %s\n' 'powershell -ExecutionPolicy Bypass -File .\wef-forwarder-setup.ps1 -PfxPath .\client.pfx -CaPath .\ca.crt'
+        echo -e "  ${DIM}-PfxPath and -CaPath are optional if the certificates are already installed.${NC}"
+    fi
+    pause
+}
+
+_dp_wef_write_forwarder_ps1() {
+    local out="$1" host="$2" port="$3" thumb="$4"
+    cat > "$out" <<PS1
+# Windows Event Forwarding - forwarder setup for Data Pipeline site ${OBSERVO_SITE_ID:-?}
+# Generated by Data Pipeline Doctor on $(date -u +%Y-%m-%dT%H:%M:%SZ). Run in an elevated PowerShell.
+# In a domain, prefer setting the subscription manager by GPO; this script writes the same
+# policy value directly to the registry, which suits labs and standalone hosts.
+param(
+    [string]\$PfxPath = "",   # client certificate (.pfx) to import, optional
+    [string]\$CaPath  = ""    # CA certificate (.crt/.cer) to import, optional
+)
+\$ErrorActionPreference = "Stop"
+\$Collector = "${host}"
+\$Port      = ${port}
+\$IssuerCA  = "${thumb}"
+\$Sub = "Server=HTTPS://\${Collector}:\${Port}/wsman/SubscriptionManager/WEC,Refresh=60,IssuerCA=\${IssuerCA}"
+
+if (\$CaPath)  { Import-Certificate -FilePath \$CaPath -CertStoreLocation Cert:\LocalMachine\Root | Out-Null; "Imported CA" }
+if (\$PfxPath) {
+    \$pw = Read-Host "Password for \$PfxPath" -AsSecureString
+    Import-PfxCertificate -FilePath \$PfxPath -CertStoreLocation Cert:\LocalMachine\My -Password \$pw | Out-Null
+    "Imported client certificate"
+}
+
+\$ca = Get-ChildItem Cert:\LocalMachine\Root | Where-Object Thumbprint -eq \$IssuerCA
+if (-not \$ca) { throw "CA \$IssuerCA is not in LocalMachine\Root - pass -CaPath" }
+\$client = Get-ChildItem Cert:\LocalMachine\My | Where-Object { \$_.Issuer -eq \$ca.Subject -and \$_.HasPrivateKey } | Select-Object -First 1
+if (-not \$client) { throw "No client certificate issued by '\$(\$ca.Subject)' in LocalMachine\My - pass -PfxPath" }
+"Client certificate: \$(\$client.Subject) \$(\$client.Thumbprint)"
+
+# NETWORK SERVICE (the forwarder's account) must read the client key.
+\$rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey(\$client)
+\$keyName = if (\$rsa.Key) { \$rsa.Key.UniqueName } else { \$rsa.CspKeyContainerInfo.UniqueKeyContainerName }
+\$keyFile = @("\$env:ProgramData\Microsoft\Crypto\Keys\\\$keyName", "\$env:ProgramData\Microsoft\Crypto\RSA\MachineKeys\\\$keyName") |
+           Where-Object { Test-Path \$_ } | Select-Object -First 1
+if (\$keyFile) { icacls \$keyFile /grant "NT AUTHORITY\NETWORK SERVICE:R" | Out-Null; "Granted NETWORK SERVICE read on the private key" }
+else { Write-Warning "Private key file not found - grant NETWORK SERVICE read via certlm.msc -> Manage Private Keys" }
+
+# Check first: "net localgroup /add" fails (error 1378) when already a member,
+# which would stop the script on a re-run.
+if (-not ((net localgroup "Event Log Readers") -match "NETWORK SERVICE")) {
+    net localgroup "Event Log Readers" "NT AUTHORITY\NETWORK SERVICE" /add | Out-Null
+}
+"NETWORK SERVICE is in Event Log Readers"
+
+Set-Service WinRM -StartupType Automatic
+\$k = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\EventLog\EventForwarding\SubscriptionManager"
+New-Item -Path \$k -Force | Out-Null
+Set-ItemProperty -Path \$k -Name "1" -Value \$Sub
+"Subscription manager: \$Sub"
+Restart-Service WinRM -Force
+
+"Reachability: \$((Test-NetConnection \$Collector -Port \$Port -WarningAction SilentlyContinue).TcpTestSucceeded)"
+Start-Sleep 30
+Get-WinEvent -LogName "Microsoft-Windows-Forwarding/Operational" -MaxEvents 5 -ErrorAction SilentlyContinue |
+    ForEach-Object { "{0:HH:mm:ss} id={1} {2}" -f \$_.TimeCreated, \$_.Id, (\$_.Message -replace '\s+',' ') }
+"104 = connected to the subscription manager; 105 = error (see the message)."
+PS1
+}
+
+docker_wef_tls_test() {
+    banner
+    echo -e "  ${BOLD}WEF TLS endpoint test — $DOCKER_CONTAINER${NC}"
+    echo -e "  ${DIM}Checks the certificates the WEF source uses and does a real TLS handshake.${NC}"
+    echo ""
+    _dp_wef_read_config
+    if ! $DP_WEF_FOUND; then
+        log_err "No WEF source in this site's pipeline yet — add it in the console first."
+        pause; return
+    fi
+    _dp_wef_cert_roles
+    local cport="${DP_WEF_LISTEN##*:}" host="${DP_WEF_CALLBACK%:*}" hport problems=0
+    hport="$(_dp_wef_host_port)"
+
+    # Certificates
+    if [[ -z "$DP_WEF_CRT" || -z "$DP_WEF_KEY" || -z "$DP_WEF_CA" ]]; then
+        log_err "Could not identify the CA, certificate and key paths from the source config"
+        ((problems++))
+    elif ! dexec test -r "$DP_WEF_CRT" 2>/dev/null; then
+        log_err "Certificate files aren't readable inside the container — run Tools 15 → 2 first"
+        ((problems++))
+    else
+        local subj san end
+        subj=$(_dp_wef_ssl x509 -in "$DP_WEF_CRT" -noout -subject | sed 's/^subject=[[:space:]]*//')
+        san=$(_dp_wef_ssl x509 -in "$DP_WEF_CRT" -noout -ext subjectAltName | grep -oE 'DNS:[^,]+' | sed 's/DNS://' | paste -sd, -)
+        end=$(_dp_wef_ssl x509 -in "$DP_WEF_CRT" -noout -enddate | sed 's/notAfter=//')
+        log_info "Server certificate: ${subj}  (SAN: ${san:-none}; expires ${end})"
+
+        if [[ ",${san}," == *",${host},"* ]]; then
+            log_ok "Certificate covers the callback host ${host}"
+        else
+            log_err "Callback host ${host} is not in the certificate's SAN (${san:-none}) — forwarders will reject it"
+            ((problems++))
+        fi
+        if _dp_wef_ssl verify -CAfile "$DP_WEF_CA" "$DP_WEF_CRT" | grep -q ': OK$'; then
+            log_ok "Certificate is signed by the configured CA"
+        else
+            log_err "Certificate does not verify against the configured CA ($DP_WEF_CA)"
+            ((problems++))
+        fi
+        local c k
+        c=$(dexec sh -c "openssl x509 -in '$DP_WEF_CRT' -noout -pubkey | openssl sha256" 2>/dev/null)
+        k=$(dexec sh -c "openssl pkey -in '$DP_WEF_KEY' -pubout | openssl sha256" 2>/dev/null)
+        if [[ -n "$c" && "$c" == "$k" ]]; then
+            log_ok "Private key matches the certificate"
+        else
+            log_err "Private key does not match the certificate (or could not be read)"
+            ((problems++))
+        fi
+        if ! dexec openssl x509 -in "$DP_WEF_CRT" -noout -checkend 0 >/dev/null 2>&1; then
+            log_err "Certificate has expired"; ((problems++))
+        elif ! dexec openssl x509 -in "$DP_WEF_CRT" -noout -checkend $((30*86400)) >/dev/null 2>&1; then
+            log_warn "Certificate expires within 30 days"
+        fi
+        if _dp_wef_ssl x509 -in "$DP_WEF_CRT" -noout -ext extendedKeyUsage | grep -q 'Server Authentication'; then
+            log_ok "Certificate has the Server Authentication EKU"
+        else
+            log_warn "Certificate has no Server Authentication EKU — some Windows builds reject it"
+        fi
+        log_info "CA thumbprint (IssuerCA= on forwarders): $(_dp_wef_ca_thumbprint)"
+    fi
+    echo ""
+
+    # Listener + handshake (from inside the container: this host may have no openssl)
+    local hs
+    hs=$(dexec sh -c "timeout 10 openssl s_client -connect 127.0.0.1:${cport} -servername '${host}' -CAfile '${DP_WEF_CA}' </dev/null 2>&1" 2>/dev/null)
+    if [[ "$hs" == *"Verify return code: 0 (ok)"* ]]; then
+        log_ok "TLS handshake on container port ${cport} succeeded ($(echo "$hs" | grep -m1 -oE 'TLSv1\.[0-3]'), verified against the CA)"
+    elif [[ -z "$hs" || "$hs" == *"Connection refused"* || "$hs" == *"errno=111"* ]]; then
+        log_err "Nothing is listening on container port ${cport} — the WEF source isn't running (check Tools 15 → 1 for the last error)"
+        ((problems++))
+    else
+        log_err "TLS handshake on container port ${cport} failed: $(echo "$hs" | grep -m1 -E 'Verify return code|error|errno' | cut -c1-120)"
+        ((problems++))
+    fi
+
+    # Host port (what forwarders actually reach)
+    if [[ -z "$hport" ]]; then
+        log_err "Container port ${cport} is not published on the host (see Source ports)"
+        ((problems++))
+    elif timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/${hport}" 2>/dev/null; then
+        log_ok "Host port ${hport} accepts connections"
+    else
+        log_err "Host port ${hport} does not accept connections (firewall, or another process holds it)"
+        ((problems++))
+    fi
+
+    # Name resolution (informational: what matters is what the forwarders resolve)
+    local res
+    res=$(getent hosts "$host" 2>/dev/null | awk '{print $1}' | paste -sd, -)
+    if [[ -n "$res" ]]; then
+        log_info "${host} resolves to ${res} from this host — forwarders must reach this host at that name"
+    else
+        log_warn "${host} doesn't resolve from this host — fine if only the forwarders' DNS or hosts files have it"
+    fi
+
+    echo ""
+    if [[ $problems -eq 0 ]]; then
+        log_ok "TLS endpoint looks good. If forwarders still don't connect, check their side (Tools 15 → 3)."
+    else
+        log_err "${problems} problem(s) found."
+    fi
+    echo -e "  ${DIM}This test's own handshake appears once in the site logs as a TLS handshake failure; that's expected.${NC}"
+    pause
+}
+
+# Summarise forwarder traffic from the container's WEF log lines.
+# Reads log lines on stdin; prints the report. Split out so it can be tested.
+_dp_wef_activity_report() {
+    awk '
+    function hhmm(ts) { return substr(ts, 12, 8) "Z" }
+    # mawk/BWK awk have no asorti: insertion-sort the keys into dst[1..n].
+    function sortkeys(src, dst,    k, n, i, j, t) {
+        n = 0; for (k in src) dst[++n] = k
+        for (i = 2; i <= n; i++) { t = dst[i]; for (j = i - 1; j >= 1 && dst[j] > t; j--) dst[j + 1] = dst[j]; dst[j + 1] = t }
+        return n
+    }
+    /wef::wef::server: Enumerate request from/ {
+        if (match($0, /principal: [^)]+/)) { p = substr($0, RSTART + 11, RLENGTH - 11); if (!(p in conns)) nf++; conns[p]++; last[p] = $1 }
+    }
+    /wef::wef::server: Received [0-9]+ events/ {
+        if (match($0, /Received [0-9]+ events/)) { n = substr($0, RSTART + 9, RLENGTH - 16) + 0; ev += n; batches++; lastev = $1
+            hr = substr($1, 12, 2) ":00"; perhour[hr] += n }
+    }
+    /TLS handshake failed/ { ntls++
+        if ($0 ~ /unexpected EOF/) tls["unexpected EOF (Windows probe connection — normal)"]++
+        else if ($0 ~ /session id context uninitialized/) tls["session resumption refused (Windows retries with a full handshake — normal)"]++
+        else if ($0 ~ /peer did not return a certificate/) tls["no client certificate sent (Doctor TLS test, or a forwarder missing its client cert)"]++
+        else if ($0 ~ /certificate unknown|unknown ca|bad certificate/) tls["client rejected or sent an untrusted certificate"]++
+        else tls["other"]++
+    }
+    /TLS handshake timed out/ { ntls++; tls["timed out"]++ }
+    /ERROR/ && /wef/ { nerr++; errs[nerr] = $0 }
+    END {
+        print "FORWARDERS"
+        if (nf == 0) print "  (none)"
+        for (p in conns) printf "  %-28s %5d connection(s), last %s\n", p, conns[p], hhmm(last[p])
+        print "EVENTS"
+        if (batches == 0) print "  (none received)"
+        else {
+            printf "  %d event(s) in %d batch(es), last batch %s\n", ev, batches, hhmm(lastev)
+            n = sortkeys(perhour, hours)
+            for (i = 1; i <= n; i++) printf "    %s  %d\n", hours[i], perhour[hours[i]]
+        }
+        print "TLS"
+        if (ntls == 0) print "  (no handshake failures)"
+        for (r in tls) printf "  %5d  %s\n", tls[r], r
+        print "ERRORS"
+        if (nerr == 0) print "  (none)"
+        for (i = (nerr > 5 ? nerr - 4 : 1); i <= nerr; i++) print "  " substr(errs[i], 1, 160)
+    }'
+}
+
+docker_wef_activity() {
+    banner
+    echo -e "  ${BOLD}WEF forwarder activity — $DOCKER_CONTAINER${NC}"
+    echo ""
+    local hours
+    read -rp "  How far back, in hours [24]: " hours || _dpd_eof_exit
+    hours="${hours:-24}"
+    [[ "$hours" =~ ^[0-9]+$ && "$hours" -gt 0 ]] || hours=24
+    echo ""
+    local report section line
+    report=$(dk logs "$DOCKER_CONTAINER" --since "${hours}h" 2>&1 | grep -E 'wef::|component_type=wef' | _dp_wef_activity_report)
+    while IFS= read -r line; do
+        case "$line" in
+            FORWARDERS) echo -e "  ${BOLD}Forwarders (by client certificate name)${NC}" ;;
+            EVENTS)     echo ""; echo -e "  ${BOLD}Events received${NC}  ${DIM}(per hour, UTC)${NC}" ;;
+            TLS)        echo ""; echo -e "  ${BOLD}TLS handshake failures${NC}" ;;
+            ERRORS)     echo ""; echo -e "  ${BOLD}Recent WEF errors${NC}" ;;
+            *)          echo "$line" ;;
+        esac
+    done <<< "$report"
+    echo ""
+    echo -e "  ${DIM}Last ${hours}h of container logs. Forwarders are named by the CN of their client certificate;${NC}"
+    echo -e "  ${DIM}hosts that share one certificate appear as one. Remote addresses are the Docker bridge${NC}"
+    echo -e "  ${DIM}(port publishing NATs them), so they don't identify a forwarder.${NC}"
+    pause
+}
+
 docker_menu_wef() {
     while true; do
         banner
@@ -4889,14 +5224,20 @@ docker_menu_wef() {
         fi
         echo -e "    ${CYAN} 1)${NC} Readiness check (read-only)"
         echo -e "    ${CYAN} 2)${NC} Make this site WEF-ready (one recreate)"
+        echo -e "    ${CYAN} 3)${NC} Windows forwarder setup (steps + PowerShell script)"
+        echo -e "    ${CYAN} 4)${NC} TLS endpoint test"
+        echo -e "    ${CYAN} 5)${NC} Forwarder activity"
         echo ""
         echo -e "    ${CYAN} 0)${NC} Back"
         echo ""
         local choice
-        read -rp "  Choose [0-2]: " choice || return
+        read -rp "  Choose [0-5]: " choice || return
         case "$choice" in
             1) docker_wef_menu_readiness ;;
             2) docker_wef_make_ready ;;
+            3) docker_wef_forwarder_setup ;;
+            4) docker_wef_tls_test ;;
+            5) docker_wef_activity ;;
             0|*) return ;;
         esac
     done

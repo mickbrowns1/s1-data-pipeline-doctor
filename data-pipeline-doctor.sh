@@ -11,6 +11,8 @@ KUBECONFIG="${KUBECONFIG:-}"
 HOST_CA_PATH=""
 DETECTED_ISSUES=()
 DP_EXTRA_MOUNTS=()   # set by a caller before _dp_build_run_cmd to add -v mounts; consumed (cleared) by it
+DP_EXTRA_ENV=()       # set by a caller before _dp_build_run_cmd to add KEY=value env lines; consumed (cleared) by it
+WEF_MODE=false        # does this host manage WEF/WEC-forwarding sites? asked once at startup, saved to a profile file
 
 # --- Site type (kubernetes | docker) ---
 SITE_TYPE=""                                     # chosen at startup
@@ -361,6 +363,7 @@ preflight() {
     _dpd_detect_os   # sets DPD_OS_FAMILY early — reusable by all menus (e.g. syslog tester sender)
     choose_site_type
     if [[ "$SITE_TYPE" == "docker" ]]; then
+        _dpd_load_wef_mode || _dpd_ask_wef_mode   # WEF/WEC support is Docker-only; ask once, then remember
         docker_preflight
     else
         preflight_k8s
@@ -2541,6 +2544,45 @@ _dpd_home() {
     echo "$HOME"
 }
 
+# chown a path back to the real invoking user when running under sudo, so a
+# file Doctor writes into that user's home isn't left root-owned. No-op
+# outside sudo. Matches the home-resolution rule in _dpd_home above.
+_dpd_chown_back() {
+    [[ ${EUID:-$(id -u)} -eq 0 && -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]] || return 0
+    chown "$SUDO_USER" "$@" 2>/dev/null
+}
+
+# A small global profile (not per-site) remembering whether this host
+# manages WEF/WEC-forwarding sites, so the startup question is only asked
+# once. Sets WEF_MODE; returns 1 if there's no saved answer yet.
+_dpd_profile_file() { echo "$(_dpd_home)/.data-pipeline-doctor/profile"; }
+
+_dpd_load_wef_mode() {
+    local pf line
+    pf="$(_dpd_profile_file)"
+    [[ -f "$pf" ]] || return 1
+    local found=false
+    while IFS= read -r line; do
+        case "$line" in
+            wef=true)  WEF_MODE=true;  found=true ;;
+            wef=false) WEF_MODE=false; found=true ;;
+        esac
+    done < "$pf"
+    $found
+}
+
+_dpd_ask_wef_mode() {
+    echo ""
+    local ans
+    read -rp "  Will this site receive Windows events over WEF/WEC? [y/N] " ans || ans=""
+    local pf dir
+    pf="$(_dpd_profile_file)"; dir="$(dirname "$pf")"
+    mkdir -p "$dir" 2>/dev/null
+    if [[ "$ans" =~ ^[Yy] ]]; then WEF_MODE=true; else WEF_MODE=false; fi
+    echo "wef=${WEF_MODE}" > "$pf" 2>/dev/null
+    _dpd_chown_back "$pf" "$dir"
+}
+
 # Prompt for the .env contents directly instead of waiting on a file copy —
 # sidesteps every "wrong home dir / wrong filename / NFS cache / sudo vs
 # root" flavor of "the file isn't where I expect" report.
@@ -3180,6 +3222,134 @@ docker_fix_oom() {
     return 1
 }
 
+# ============================================================
+#  WEF/WEC integration — shared read-only helpers
+# ============================================================
+# Best-effort read of a WEF source's settings from inside the container's
+# own resolved config. `collector_address` is confirmed as the real internal
+# key name (it appears verbatim in the product's own startup error: "...and
+# collector_address is unset..."). The cert file paths are identified
+# generically (anything path-shaped ending in .crt/.key/.pem) rather than by
+# a specific key name, since the exact schema for that part hasn't been
+# confirmed against a live config file — only that the paths are "delivered"
+# into this file. Sets DP_WEF_FOUND, DP_WEF_LISTEN, DP_WEF_CALLBACK,
+# DP_WEF_CERT_PATHS (array, deduped).
+_dp_wef_read_config() {
+    DP_WEF_FOUND=false
+    DP_WEF_LISTEN=""
+    DP_WEF_CALLBACK=""
+    DP_WEF_CERT_PATHS=()
+
+    local cfg
+    cfg=$(dexec sh -c "cat /etc/dataplane/config.yaml /etc/collector/config.yaml 2>/dev/null" 2>/dev/null)
+    [[ -z "$cfg" ]] && return 1
+    echo "$cfg" | grep -q "collector_address" || return 1
+
+    DP_WEF_FOUND=true
+    # Field order relative to collector_address isn't confirmed, so look a
+    # few lines both before and after it rather than assuming address:
+    # comes after (a real stub config caught this the other way around).
+    DP_WEF_LISTEN=$(echo "$cfg" | grep -B5 -A5 -i "collector_address" | grep -E '^[[:space:]]*address:' \
+        | head -1 | sed 's/^[[:space:]]*address:[[:space:]]*//')
+    DP_WEF_CALLBACK=$(echo "$cfg" | grep -E 'collector_address:' | head -1 | sed 's/.*collector_address:[[:space:]]*//')
+
+    local path
+    while IFS= read -r path; do
+        [[ -n "$path" ]] && DP_WEF_CERT_PATHS+=("$path")
+    done < <(echo "$cfg" | grep -oE '/[A-Za-z0-9_./-]+\.(crt|key|pem)' | sort -u)
+    return 0
+}
+
+# Populates DP_WEF_REPORT (array of "LEVEL|message", LEVEL one of
+# OK/WARN/FAIL), DP_WEF_ISSUES (FAIL count), DP_WEF_WARNINGS (WARN count).
+# Read-only — safe to call often, including just to render the live menu
+# count. Requires $DOCKER_CONTAINER to already be resolved.
+_dp_wef_check() {
+    DP_WEF_REPORT=()
+    DP_WEF_ISSUES=0
+    DP_WEF_WARNINGS=0
+
+    _dp_wef_read_config
+    if $DP_WEF_FOUND; then
+        DP_WEF_REPORT+=("OK|WEF source found — listen ${DP_WEF_LISTEN:-unknown}, callback ${DP_WEF_CALLBACK:-unknown}")
+    else
+        DP_WEF_REPORT+=("FAIL|No WEF source found in the dataplane config")
+        ((DP_WEF_ISSUES++))
+        return 0   # nothing else below is meaningful without a WEF source
+    fi
+
+    # Port published on the host
+    local cport="${DP_WEF_LISTEN##*:}" hp hport cport2 published=false
+    if [[ "$cport" =~ ^[0-9]+$ ]]; then
+        while IFS='|' read -r hp hport cport2; do
+            [[ -z "$cport2" ]] && continue
+            [[ "${cport2%%/*}" == "$cport" ]] && published=true
+        done < <(dinspect '{{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostIp}}|{{.HostPort}}|{{$p}}{{println}}{{end}}{{end}}')
+        if $published; then
+            DP_WEF_REPORT+=("OK|Container port ${cport} is published on the host")
+        else
+            DP_WEF_REPORT+=("FAIL|Container port ${cport} is not published on the host (see Source ports)")
+            ((DP_WEF_ISSUES++))
+        fi
+    else
+        DP_WEF_REPORT+=("WARN|Could not determine the WEF listen port from the config")
+        ((DP_WEF_WARNINGS++))
+    fi
+
+    # Checkpoint store mounted
+    if dinspect '{{range .Mounts}}{{.Destination}}{{println}}{{end}}' | grep -qF "/etc/dataplane/dataplane-globals.yaml"; then
+        DP_WEF_REPORT+=("OK|Checkpoint store config is mounted")
+    else
+        DP_WEF_REPORT+=("FAIL|No checkpoint store config mounted")
+        ((DP_WEF_ISSUES++))
+    fi
+
+    # Cert paths mounted and readable by uid 1000 (the container's user)
+    if [[ ${#DP_WEF_CERT_PATHS[@]} -eq 0 ]]; then
+        DP_WEF_REPORT+=("WARN|Could not identify certificate file paths from the dataplane config")
+        ((DP_WEF_WARNINGS++))
+    else
+        local p
+        for p in "${DP_WEF_CERT_PATHS[@]}"; do
+            if dexec test -r "$p" 2>/dev/null; then
+                DP_WEF_REPORT+=("OK|Readable inside the container: $p")
+            else
+                DP_WEF_REPORT+=("FAIL|Not readable inside the container (check the mount and uid 1000 ownership): $p")
+                ((DP_WEF_ISSUES++))
+            fi
+        done
+    fi
+
+    # Crypto mode — WEF cannot build its TLS identity with FIPS on (image 2.46.0)
+    local opensslconf
+    opensslconf=$(dinspect '{{range .Config.Env}}{{println .}}{{end}}' | grep '^OPENSSL_CONF=' | cut -d= -f2-)
+    if [[ "$opensslconf" == *openssl.cnf.default ]]; then
+        DP_WEF_REPORT+=("OK|FIPS mode disabled for WEF (OPENSSL_CONF=${opensslconf})")
+    else
+        DP_WEF_REPORT+=("WARN|FIPS mode is likely on — WEF fails to start on image 2.46.0 with FIPS enabled (PKCS12KDF). See 'Make this site WEF-ready'.")
+        ((DP_WEF_WARNINGS++))
+    fi
+
+    # Last WEF runtime error + forwarders seen (informational)
+    local logs lasterr principals
+    logs=$(dk logs "$DOCKER_CONTAINER" --tail 300 2>&1 || true)
+    lasterr=$(echo "$logs" | grep -iE "checkpoint store configured|PKCS12KDF|collector_address is unset" | tail -1)
+    if [[ -n "$lasterr" ]]; then
+        DP_WEF_REPORT+=("WARN|Last WEF error in recent logs: ${lasterr#*Z }")
+        ((DP_WEF_WARNINGS++))
+    else
+        DP_WEF_REPORT+=("OK|No WEF error patterns in recent logs")
+    fi
+
+    principals=$(echo "$logs" | grep -oE 'principal: [^)]+' | sed 's/principal: //' | sort -u)
+    if [[ -n "$principals" ]]; then
+        DP_WEF_REPORT+=("OK|Forwarders seen recently: $(echo "$principals" | paste -sd, -)")
+    else
+        DP_WEF_REPORT+=("WARN|No forwarders seen in recent logs yet")
+        ((DP_WEF_WARNINGS++))
+    fi
+}
+
 # A Windows Event Forwarding source stops at startup with "No checkpoint
 # store configured" on a Docker standalone site — the dataplane's checkpoint
 # settings aren't loaded from the Add Source form. Writes a small YAML file
@@ -3233,9 +3403,7 @@ EOF
     # Under sudo, root wrote this into the real user's home (_dpd_home) —
     # give it back to them so it's not a root-owned file sitting in their
     # own home directory.
-    if [[ ${EUID:-$(id -u)} -eq 0 && -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
-        chown "$SUDO_USER" "$hostfile" "$(dirname "$hostfile")" 2>/dev/null
-    fi
+    _dpd_chown_back "$hostfile" "$(dirname "$hostfile")"
 
     local compose_file=""
     _dp_compose_info && compose_file="$DP_COMPOSE_FILE"
@@ -3312,6 +3480,17 @@ docker_full_scan() {
     docker_scan_dns;           hr
     docker_scan_storage;       hr
     docker_scan_resources;     hr
+    if $WEF_MODE; then
+        # Informational only here — most WEF readiness items don't have a
+        # dispatcher entry in run_all_fixes (only wef-checkpoint-store does,
+        # already raised by docker_scan_service_logs above). "Make this site
+        # WEF-ready" in the WEF/WEC Integration menu is the actual fix path.
+        echo -e "  ${BOLD}WEF/WEC readiness${NC}"
+        echo ""
+        _dp_wef_check
+        _dp_wef_print_report
+        hr
+    fi
 
     echo ""
     if [[ ${#DETECTED_ISSUES[@]} -eq 0 ]]; then
@@ -3982,6 +4161,41 @@ _dp_compose_add_mount() {
     fi
 }
 
+# Add or update a KEY=value entry in a Compose file's service `environment:`
+# list (list form, matching this tool's own style for ports:/volumes:).
+# Unlike volumes:, environment: has no top-level meaning in the Compose
+# spec, so (like ports:/mem_limit:) a generic indentation match is safe
+# here. Creates the key if missing; replaces the whole line in place if the
+# key is already set (only recognizes the exact quoted form this tool
+# itself writes — a hand-edited line in a different style won't match and
+# a second entry will be appended instead, which Compose resolves by last
+# value winning).
+_dp_compose_set_env() {
+    local file="$1" key="$2" value="$3"
+    if grep -qE "^[[:space:]]*- \"${key}=" "$file"; then
+        awk -v key="$key" -v value="$value" '
+            $0 ~ ("^[[:space:]]*- \"" key "=") { print "      - \"" key "=" value "\""; next }
+            { print }
+        ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+        return
+    fi
+    if grep -qE '^[[:space:]]*environment:[[:space:]]*$' "$file"; then
+        awk -v key="$key" -v value="$value" '
+            { print }
+            /^[[:space:]]*environment:[[:space:]]*$/ && !done { print "      - \"" key "=" value "\""; done=1 }
+        ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+    else
+        awk -v key="$key" -v value="$value" '
+            { print }
+            /^[[:space:]]*container_name:/ && !done {
+                print "    environment:"
+                print "      - \"" key "=" value "\""
+                done=1
+            }
+        ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+    fi
+}
+
 # Reconstruct the `docker run` argv for the current container, adding extra -p
 # mappings ($@). Sets globals DP_RUN_CMD (array) and DP_ENV_FILE. Env is written
 # to a 0600 --env-file (HOSTNAME dropped so Docker assigns a fresh one) — secrets
@@ -3990,6 +4204,9 @@ _dp_build_run_cmd() {
     local envfile="$HOME/.data-pipeline-doctor/${DOCKER_CONTAINER}.env"
     mkdir -p "$(dirname "$envfile")" 2>/dev/null
     dinspect '{{range .Config.Env}}{{println .}}{{end}}' | grep -vE '^HOSTNAME=' > "$envfile" 2>/dev/null
+    local ee
+    for ee in "${DP_EXTRA_ENV[@]}"; do echo "$ee" >> "$envfile"; done
+    DP_EXTRA_ENV=()   # consume so an env override never leaks into an unrelated later call
     chmod 600 "$envfile" 2>/dev/null
     DP_ENV_FILE="$envfile"
 
@@ -4167,6 +4384,235 @@ docker_menu_source_ports() {
             pause ;;
         *) return ;;
     esac
+}
+
+_dp_wef_print_report() {
+    local line level msg
+    for line in "${DP_WEF_REPORT[@]:-}"; do
+        [[ -z "$line" ]] && continue
+        level="${line%%|*}"; msg="${line#*|}"
+        case "$level" in
+            OK)   log_ok "$msg" ;;
+            WARN) log_warn "$msg" ;;
+            FAIL) log_err "$msg" ;;
+            *)    echo "    $msg" ;;
+        esac
+    done
+}
+
+docker_wef_menu_readiness() {
+    banner
+    echo -e "  ${BOLD}WEF/WEC Readiness Check — $DOCKER_CONTAINER${NC}"
+    echo -e "  ${DIM}Read-only — nothing here changes anything.${NC}"
+    echo ""
+    _dp_wef_check
+    _dp_wef_print_report
+    echo ""
+    if [[ $DP_WEF_ISSUES -eq 0 ]]; then
+        log_ok "No blocking issues found${DP_WEF_WARNINGS:+ (${DP_WEF_WARNINGS} warning(s))}."
+    else
+        echo -e "  ${RED}${BOLD}${DP_WEF_ISSUES} blocking issue(s) found.${NC}"
+        echo "    Use '2) Make this site WEF-ready' to fix what can be fixed automatically."
+    fi
+    pause
+}
+
+# Bundles everything WEF needs into ONE recreate: checkpoint store, cert
+# mount at the paths the console source actually expects, and disabling
+# FIPS crypto if it's on (confirmed live: WEF cannot build its TLS identity
+# with FIPS enabled on image 2.46.0). Each piece reuses the same
+# Compose-sync / raw-run-recreate pattern as the other fixes. The cert
+# source directory on the host isn't guessable — Doctor asks for it rather
+# than assuming a path.
+docker_wef_make_ready() {
+    banner
+    echo -e "  ${BOLD}Make this site WEF-ready — $DOCKER_CONTAINER${NC}"
+    echo ""
+    _dp_wef_check
+
+    if ! $DP_WEF_FOUND; then
+        log_err "No WEF source found in the dataplane config — add the Windows Event Forwarding source in the console first."
+        pause; return
+    fi
+
+    local need_checkpoint=false need_certs=false need_fips=false
+    dinspect '{{range .Mounts}}{{.Destination}}{{println}}{{end}}' | grep -qF "/etc/dataplane/dataplane-globals.yaml" \
+        || need_checkpoint=true
+
+    if [[ ${#DP_WEF_CERT_PATHS[@]} -eq 0 ]]; then
+        need_certs=true
+    else
+        local p
+        for p in "${DP_WEF_CERT_PATHS[@]}"; do
+            dexec test -r "$p" 2>/dev/null || need_certs=true
+        done
+    fi
+
+    local opensslconf
+    opensslconf=$(dinspect '{{range .Config.Env}}{{println .}}{{end}}' | grep '^OPENSSL_CONF=' | cut -d= -f2-)
+    [[ "$opensslconf" == *openssl.cnf.default ]] || need_fips=true
+
+    if ! $need_checkpoint && ! $need_certs && ! $need_fips; then
+        log_ok "Already WEF-ready — nothing to do."
+        pause; return
+    fi
+
+    echo "  Plan:"
+    $need_checkpoint && echo "    - Write and mount a checkpoint store (dataplane-globals.yaml)"
+    if $need_certs; then
+        echo "    - Mount certificate files at the path(s) the source expects:"
+        if [[ ${#DP_WEF_CERT_PATHS[@]} -gt 0 ]]; then
+            local p; for p in "${DP_WEF_CERT_PATHS[@]}"; do echo "        $p"; done
+        else
+            echo "        (could not read the expected paths from the config — you'll confirm the host side, but"
+            echo "         the container-side destination will need to be entered too)"
+        fi
+    fi
+    $need_fips && echo "    - Disable FIPS-mode crypto for this site (OPENSSL_CONF=/etc/ssl/openssl.cnf.default) — WEF cannot start with FIPS on"
+    echo ""
+
+    local cert_src_dir="" cert_dst_dir=""
+    if $need_certs; then
+        echo -e "  ${YELLOW}Where are the server certificate, key, and CA file on THIS host right now?${NC}"
+        echo "    (the folder containing them, e.g. /opt/s1-wef)"
+        read -rp "  Host cert directory: " cert_src_dir
+        if [[ -z "$cert_src_dir" || ! -d "$cert_src_dir" ]]; then
+            log_err "No valid directory given — aborting."
+            pause; return
+        fi
+        if [[ ${#DP_WEF_CERT_PATHS[@]} -gt 0 ]]; then
+            cert_dst_dir="$(dirname "${DP_WEF_CERT_PATHS[0]}")"
+        else
+            read -rp "  Container-side path the source expects these files at (e.g. /etc/s1/wef): " cert_dst_dir
+            if [[ -z "$cert_dst_dir" ]]; then
+                log_err "No destination path given — aborting."
+                pause; return
+            fi
+        fi
+    fi
+
+    if $need_fips; then
+        echo ""
+        echo -e "  ${RED}${BOLD}FIPS warning:${NC} this disables FIPS-validated crypto for the WHOLE site, not just WEF."
+        echo "    Do not do this in a FedRAMP/DoD or other FIPS-required environment."
+        if ! confirm "Disable FIPS-validated crypto for this entire site?"; then
+            need_fips=false
+            log_warn "Skipping the FIPS change — WEF will likely still fail to start until this is addressed."
+        fi
+    fi
+
+    echo ""
+    if ! confirm "Apply the plan above and recreate $DOCKER_CONTAINER now (one recreate, existing container backed up)?"; then
+        pause; return
+    fi
+
+    local hostfile="$(_dpd_home)/.data-pipeline-doctor/dataplane-globals.yaml"
+    if $need_checkpoint; then
+        mkdir -p "$(dirname "$hostfile")" 2>/dev/null
+        cat > "$hostfile" <<'EOF'
+# Lab workaround: checkpoint store for the dataplane instance (WEF source needs one).
+# Mirrors /etc/collector-globals/collector-globals.yaml, with a separate db file.
+data_dir: /var/observo/data/dataplane
+checkpoint:
+  store_path: /var/observo/data/dataplane/checkpoints.db3
+EOF
+        chmod 644 "$hostfile" 2>/dev/null
+        _dpd_chown_back "$hostfile" "$(dirname "$hostfile")"
+    fi
+
+    if $need_certs; then
+        chmod -R a+r "$cert_src_dir" 2>/dev/null
+        local keyfile
+        keyfile=$(find "$cert_src_dir" -iname "*.key" 2>/dev/null | head -1)
+        [[ -n "$keyfile" ]] && chmod 600 "$keyfile" 2>/dev/null
+        if [[ $(_dpd_sudo) == "sudo" ]]; then
+            sudo chown -R 1000:1000 "$cert_src_dir" 2>/dev/null
+        else
+            chown -R 1000:1000 "$cert_src_dir" 2>/dev/null
+        fi
+    fi
+
+    local compose_file=""
+    _dp_compose_info && compose_file="$DP_COMPOSE_FILE"
+
+    if [[ -n "$compose_file" ]]; then
+        local compose_backup="${compose_file}.bak.$(date +%Y%m%d%H%M%S)"
+        if ! cp "$compose_file" "$compose_backup"; then
+            log_err "Could not back up ${compose_file} — aborting."
+            pause; return
+        fi
+        $need_checkpoint && _dp_compose_add_mount "$compose_file" "$hostfile" "/etc/dataplane/dataplane-globals.yaml" "ro"
+        $need_certs && _dp_compose_add_mount "$compose_file" "$cert_src_dir" "$cert_dst_dir" "ro"
+        $need_fips && _dp_compose_set_env "$compose_file" "OPENSSL_CONF" "/etc/ssl/openssl.cnf.default"
+
+        if docker compose -f "$compose_file" up -d >/dev/null 2>&1; then
+            log_fix "Recreated $DOCKER_CONTAINER with the WEF changes applied."
+            log_info "Previous compose file saved as ${compose_backup}"
+        else
+            log_err "docker compose up failed — restoring the previous ${compose_file}"
+            cp "$compose_backup" "$compose_file"
+            docker compose -f "$compose_file" up -d >/dev/null 2>&1
+            pause; return
+        fi
+    else
+        DP_EXTRA_MOUNTS=()
+        $need_checkpoint && DP_EXTRA_MOUNTS+=("${hostfile}:/etc/dataplane/dataplane-globals.yaml:ro")
+        $need_certs && DP_EXTRA_MOUNTS+=("${cert_src_dir}:${cert_dst_dir}:ro")
+        DP_EXTRA_ENV=()
+        $need_fips && DP_EXTRA_ENV+=("OPENSSL_CONF=/etc/ssl/openssl.cnf.default")
+        _dp_build_run_cmd
+
+        local backup="${DOCKER_CONTAINER}_pre$(date +%s)"
+        if ! docker stop "$DOCKER_CONTAINER" >/dev/null 2>&1; then
+            log_err "Failed to stop container"; pause; return
+        fi
+        if ! docker rename "$DOCKER_CONTAINER" "$backup" >/dev/null 2>&1; then
+            log_err "Failed to rename; container is stopped — start it again with: docker start $DOCKER_CONTAINER"
+            pause; return
+        fi
+        if "${DP_RUN_CMD[@]}" >/dev/null 2>&1; then
+            log_fix "Recreated $DOCKER_CONTAINER with the WEF changes applied. Backup: $backup"
+        else
+            log_err "Recreate failed — rolling back to the previous container"
+            docker rm -f "$DOCKER_CONTAINER" >/dev/null 2>&1
+            docker rename "$backup" "$DOCKER_CONTAINER" >/dev/null 2>&1
+            docker start "$DOCKER_CONTAINER" >/dev/null 2>&1 && log_info "Rolled back; original container is running again."
+            pause; return
+        fi
+    fi
+
+    echo ""
+    log_info "Re-running the readiness check..."
+    sleep 2
+    echo ""
+    _dp_wef_check
+    _dp_wef_print_report
+    pause
+}
+
+docker_menu_wef() {
+    while true; do
+        banner
+        echo -e "  ${BOLD}WEF/WEC Integration — $DOCKER_CONTAINER${NC}"
+        echo ""
+        if ! $WEF_MODE; then
+            echo -e "  ${DIM}WEF/WEC mode is off for this host. You can still use this menu;${NC}"
+            echo -e "  ${DIM}turn it on by answering yes next time Doctor starts up.${NC}"
+            echo ""
+        fi
+        echo -e "    ${CYAN} 1)${NC} Readiness check (read-only)"
+        echo -e "    ${CYAN} 2)${NC} Make this site WEF-ready (one recreate)"
+        echo ""
+        echo -e "    ${CYAN} 0)${NC} Back"
+        echo ""
+        local choice
+        read -rp "  Choose [0-2]: " choice || return
+        case "$choice" in
+            1) docker_wef_menu_readiness ;;
+            2) docker_wef_make_ready ;;
+            0|*) return ;;
+        esac
+    done
 }
 
 # Pick a syslog-capable published port for the current container.
@@ -4364,13 +4810,19 @@ docker_main_menu() {
         printf "    ${CYAN}%2s)${NC} %-30s ${CYAN}%2s)${NC} %s\n" 9 "Restart service/container" 10 "Tail sources & destinations"
         printf "    ${CYAN}%2s)${NC} %-30s ${CYAN}%2s)${NC} %s\n" 11 "Proxy & connectivity" 12 "Source ports"
         printf "    ${CYAN}%2s)${NC} %-30s ${CYAN}%2s)${NC} %s\n" 13 "Syslog tester" 14 "Syslog stream (continuous)"
+        local wef_label="WEF/WEC integration"
+        if $WEF_MODE; then
+            _dp_wef_check
+            [[ $DP_WEF_ISSUES -gt 0 ]] && wef_label="WEF/WEC integration (${DP_WEF_ISSUES} issue$([[ $DP_WEF_ISSUES -eq 1 ]] || echo s))"
+        fi
+        printf "    ${CYAN}%2s)${NC} %s\n" 15 "$wef_label"
         echo ""
         hr
         echo ""
         echo -e "    ${CYAN} 0)${NC} Exit"
         echo ""
         local choice
-        read -rp "  Choose [0-14]: " choice || { echo ""; log_info "Goodbye."; exit 0; }
+        read -rp "  Choose [0-15]: " choice || { echo ""; log_info "Goodbye."; exit 0; }
         case "$choice" in
             1)  docker_full_scan ;;
             2)  docker_run_scan docker_scan_services "Service Health (s6)" ;;
@@ -4386,6 +4838,7 @@ docker_main_menu() {
             12) docker_menu_source_ports ;;
             13) docker_menu_syslog_test ;;
             14) docker_menu_syslog_stream ;;
+            15) docker_menu_wef ;;
             0)  echo ""; log_info "Goodbye."; exit 0 ;;
             *)  ;;
         esac

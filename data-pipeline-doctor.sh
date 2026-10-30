@@ -2654,6 +2654,13 @@ _dpd_load_wef_mode() {
 
 _dpd_ask_wef_mode() {
     echo ""
+    echo -e "  ${BOLD}Windows Event Forwarding (WEF/WEC)${NC}"
+    echo "    Answer yes if Windows hosts will forward their event logs to this site."
+    echo "    Doctor then sets the site up for it (port, certificate folder, checkpoint"
+    echo "    store, FIPS) and checks it on every run."
+    echo -e "  ${DIM}Not sure? Answer no — you can add WEF any time later from Tools 15 →${NC}"
+    echo -e "  ${DIM}Make this site WEF-ready, without reinstalling.${NC}"
+    echo ""
     local ans
     read -rp "  Will this site receive Windows events over WEF/WEC? [y/N] " ans || ans=""
     local pf dir

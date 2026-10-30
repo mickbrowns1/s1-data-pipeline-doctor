@@ -8,6 +8,13 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/).
 Changes merged since the v1.6 version bump that haven't shipped under a new
 version string yet.
 
+### Changed
+
+- New Site Setup now offers to paste the `.env` contents in directly as
+  the default option (Enter = yes) instead of defaulting to waiting on a
+  file copy. Copying the file to `~/ai-data-pipelines.env` beforehand still
+  works and is detected automatically, skipping the prompt. (2026-10-30)
+
 ### Added
 
 - WEF/WEC menu (Tools 15), options 3–5 (2026-10-30):

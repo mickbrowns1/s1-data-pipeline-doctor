@@ -2355,13 +2355,14 @@ docker_setup_new_site() {
     local user_home; user_home="$(_dpd_home)"
     local env_file="$user_home/ai-data-pipelines.env"
 
-    echo "  Copy that file to:"
+    echo "  Fastest option: paste the downloaded .env file's contents directly below."
+    echo "  Prefer to copy a file instead? Put it at this path before continuing:"
     echo -e "    ${CYAN}${env_file}${NC}"
     echo
 
     if [[ -f "$env_file" ]]; then
         log_ok "Found $env_file"
-    elif confirm "Can't get the file onto this host, or not sure it's in the right place? Paste its contents in directly instead"; then
+    elif confirm_yes "Paste the .env contents in now?"; then
         _dpd_paste_env "$env_file" || return 1
     else
         echo "  Waiting for ${env_file}...  (Ctrl-C to abort)"

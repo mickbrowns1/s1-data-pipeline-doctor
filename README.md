@@ -109,7 +109,8 @@ A Docker site is a single container (image `observo-standalone-site`) that runs 
 | 11 | **Proxy & connectivity** | Host + in-container egress tests and TLS verification to the site's endpoints |
 | 12 | **Source ports** | Show published ports (annotated by source type) and open a new one for a source — generates the `-p` mapping + recreate command (or recreates for you), plus firewall hints |
 | 13 | **Syslog tester** | Send a synthetic syslog event (Firewall, Auth, DNS, Web, or Generic) to a published source port on `localhost`. Embeds a unique UUID so you can locate the event in SDL with `message contains '<uuid>'` |
-| 15 | **WEF/WEC integration** | Read-only readiness check (source found, port published, checkpoint store, cert readability, FIPS mode, last error, forwarders seen) and a one-recreate "make this site WEF-ready" fix. Shows a live issue count in the menu when WEF mode is on (see below) |
+| 14 | **Syslog stream (continuous)** | Same event types as the tester, sent on a loop at a configurable interval — useful for soak-testing a source or watching data flow live in SDL |
+| 15 | **WEF/WEC integration** | Read-only readiness check (source found, port published, checkpoint store, cert readability, FIPS mode, last error, forwarders seen), a one-recreate "make this site WEF-ready" fix, Windows forwarder setup (prints/writes a ready-to-run PowerShell script), a TLS endpoint test, and forwarder activity. Shows a live issue count in the menu when WEF mode is on (see below) |
 | 0 | **Exit** | |
 
 ### Opening source ports
@@ -129,6 +130,8 @@ A self-hosted site receives source data on **published container ports** (Syslog
 ### WEF/WEC integration
 
 At startup, on a Docker site the tool asks once whether this host manages Windows Event Forwarding (WEF/WEC) sites, and remembers the answer (`~/.data-pipeline-doctor/profile`). When it's on, the Full diagnostic scan adds a read-only WEF readiness section, and the Docker menu's option 15 shows a live issue count.
+
+Answering yes also changes **New Site Setup**: before the container starts, it asks for the WEF listener port (default `5986`), creates and mounts a certificate directory (default `/etc/s1/wef`, read-only, owned by uid 1000), writes the checkpoint store, and offers to disable FIPS-mode crypto — so a fresh site comes up WEF-ready on the first start, no later recreate needed.
 
 Option **15 → WEF/WEC integration**:
 
@@ -182,7 +185,7 @@ Option **15 → WEF/WEC integration**:
 | **TLS CA trust** | `certificate signed by unknown authority` | Shows the required `-v <ca-bundle>:…:ro` + `SSL_CERT_FILE` recreate change, then offers a restart |
 | **OOMKilled** | `.State.OOMKilled` true | Bumps the limit live via `docker update --memory` (falls back to a recreate command) |
 | **Service down** | `s6-svstat` reports a service down | Restart the single service (`s6-svc`) or the whole container |
-| **WEF source has no checkpoint store** | `No checkpoint store configured` in logs | Writes a `dataplane-globals.yaml` and mounts it at `/etc/dataplane/dataplane-globals.yaml` (read-only), recreating the container (Compose-aware) |
+| **WEF/WEC site not ready** | Readiness check fails on checkpoint store, certificate mount, and/or FIPS-mode crypto | "Make this site WEF-ready" (option 15 → 2) fixes everything it can in **one recreate**: writes the checkpoint store, mounts the certificate directory, and disables FIPS if it's on (with its own warning and confirmation) |
 
 > A running container's mounts and environment can't be changed in place, so the TLS and proxy fixes show the exact recreate command and offer to restart the container — they don't silently recreate it.
 
@@ -199,10 +202,12 @@ Common issues (from the Data Pipelines FAQ) and where the tool helps. For Docker
 | **Connection refused on a source port** | Port not published or host firewall blocking | 12 Source ports (shows mappings, opens new ones + firewall hints) |
 | **Events dropped** | Disk queue full / memory exhausted | 6 Volume & disk · 3 Container & resources |
 | **High CPU** | Pipeline too complex / throughput over capacity | 3 Container & resources (limits vs live usage) |
+| **WEF source fails: "No checkpoint store configured"** | The dataplane has no default checkpoint store | 15 WEF/WEC integration → 1 Readiness check, then 2 Make this site WEF-ready |
+| **WEF source fails: "Could not build PKCS#12 archive … PKCS12KDF"** | FIPS-mode crypto is enabled; WEF can't build its TLS identity on image 2.46.0 with FIPS on | 15 WEF/WEC integration → 2 Make this site WEF-ready (disables FIPS site-wide — not for FedRAMP/DoD) |
 
 ## Supported sources & destinations
 
-**Self-hosted source types** (on-prem): Syslog over TCP / UDP / TLS, CEF/LEEF, Kafka consumer, HEC push (Windows Event Forwarding and File tail are post-GA). Cloud sources (Okta, AWS, Azure, GCP, SaaS) use cloud sites, not self-hosted sites.
+**Self-hosted source types** (on-prem): Syslog over TCP / UDP / TLS, CEF/LEEF, Kafka consumer, HEC push, Windows Event Forwarding/WEC (see [WEF/WEC integration](#wefwec-integration) — Doctor's option 15 sets up and diagnoses it). File tail is post-GA. Cloud sources (Okta, AWS, Azure, GCP, SaaS) use cloud sites, not self-hosted sites.
 
 **Destinations:** SentinelOne AI SIEM (default → Singularity Data Lake), Splunk HEC, Amazon S3. Self-hosted sites can fan out to multiple destinations in one pipeline.
 

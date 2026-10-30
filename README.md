@@ -148,6 +148,7 @@ A self-hosted site receives source data on **published container ports** (Syslog
 | **TLS CA trust** | `certificate signed by unknown authority` | Shows the required `-v <ca-bundle>:…:ro` + `SSL_CERT_FILE` recreate change, then offers a restart |
 | **OOMKilled** | `.State.OOMKilled` true | Bumps the limit live via `docker update --memory` (falls back to a recreate command) |
 | **Service down** | `s6-svstat` reports a service down | Restart the single service (`s6-svc`) or the whole container |
+| **WEF source has no checkpoint store** | `No checkpoint store configured` in logs | Writes a `dataplane-globals.yaml` and mounts it at `/etc/dataplane/dataplane-globals.yaml` (read-only), recreating the container (Compose-aware) |
 
 > A running container's mounts and environment can't be changed in place, so the TLS and proxy fixes show the exact recreate command and offer to restart the container — they don't silently recreate it.
 

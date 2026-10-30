@@ -8,6 +8,16 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/).
 Changes merged since the v1.6 version bump that haven't shipped under a new
 version string yet.
 
+### Added
+
+- Auto-fix for a Windows Event Forwarding source that fails to start with
+  "No checkpoint store configured" on a Docker standalone site: writes a
+  `dataplane-globals.yaml` and mounts it at
+  `/etc/dataplane/dataplane-globals.yaml`, keeping the mount in a
+  Compose-managed site's `docker-compose.yml` in sync via a new
+  `_dp_compose_add_mount` helper (same pattern as the source-ports and OOM
+  Compose-sync fixes). (`ae0b190`, 2026-10-29)
+
 ### Fixed
 
 - OOM memory-limit fix now also updates `docker-compose.yml`'s `mem_limit`

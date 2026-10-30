@@ -10,6 +10,7 @@ RELEASE_NAME="observo-site"
 KUBECONFIG="${KUBECONFIG:-}"
 HOST_CA_PATH=""
 DETECTED_ISSUES=()
+DP_EXTRA_MOUNTS=()   # set by a caller before _dp_build_run_cmd to add -v mounts; consumed (cleared) by it
 
 # --- Site type (kubernetes | docker) ---
 SITE_TYPE=""                                     # chosen at startup
@@ -412,7 +413,7 @@ main_menu() {
         echo -e "    ${CYAN} 0)${NC} Exit"
         echo ""
         local choice
-        read -rp "  Choose [0-13]: " choice
+        read -rp "  Choose [0-13]: " choice || { echo ""; log_info "Goodbye."; exit 0; }
 
         case "$choice" in
             1)  full_scan ;;
@@ -1930,6 +1931,11 @@ run_all_fixes() {
                     docker_fix_connectivity && { ((fixed++)) || true; conn_fixed=true; }
                 fi
                 ;;
+            wef-checkpoint-store:*)
+                if [[ "$SITE_TYPE" == "docker" ]]; then
+                    docker_fix_wef_checkpoint_store && { ((fixed++)) || true; }
+                fi
+                ;;
             docker-svc-down:*)
                 if $docker_init_blocked; then
                     : # services are blocked by control-plane-init; fixing init + restart is the remedy
@@ -2921,6 +2927,10 @@ docker_scan_service_logs() {
         log_err "Outbound connection failures in logs"
         add_issue "connectivity: $DOCKER_CONTAINER has outbound connection failures"; found=true
     fi
+    if echo "$logs" | grep -q "No checkpoint store configured"; then
+        log_err "A Windows Event Forwarding source has no checkpoint store configured"
+        add_issue "wef-checkpoint-store: $DOCKER_CONTAINER WEF source needs a checkpoint store"; found=true
+    fi
     if echo "$logs" | grep -qi "forbidden\|unauthorized"; then
         log_warn "Possible auth/permission errors in logs"; found=true
     fi
@@ -2940,7 +2950,7 @@ docker_scan_tls() {
     fi
 
     [[ ${#DOCKER_ENDPOINTS[@]} -eq 0 ]] && log_warn "No endpoints derived from container env"
-    local hp host port result issuer
+    local hp host port result issuer container_ok
     for hp in "${DOCKER_ENDPOINTS[@]:-}"; do
         [[ -z "$hp" ]] && continue
         host="${hp%%:*}"; port="${hp##*:}"
@@ -2950,8 +2960,20 @@ docker_scan_tls() {
             issuer=$(echo "$result" | grep "issuer=" | head -1 | sed 's/.*CN *= *//')
             log_ok "TLS $hp — issued by ${issuer:-unknown}"
         else
-            log_err "TLS $hp — verification failed from host"
-            add_issue "tls-host: Cannot verify $host from host"
+            # The host may simply lack this endpoint's name/network path (a
+            # lab-only hostname, a container-only network, etc.) while the
+            # site itself — which runs entirely inside the container — is
+            # fine. Check from inside the container before treating this as
+            # a real issue, same reasoning as the DNS check below.
+            container_ok=false
+            dexec sh -c "openssl s_client -connect '$hp' -servername '$host' </dev/null 2>&1" 2>/dev/null \
+                | grep -q "verify return:1" && container_ok=true
+            if $container_ok; then
+                log_warn "TLS $hp — verification failed from the host, but the container verifies it fine. Likely a host-only DNS/network gap, not a site problem."
+            else
+                log_err "TLS $hp — verification failed from host and from inside the container"
+                add_issue "tls-host: Cannot verify $host"
+            fi
         fi
     done
 
@@ -2971,22 +2993,32 @@ docker_scan_dns() {
     if [[ ${#DOCKER_ENDPOINTS[@]} -eq 0 ]]; then
         log_warn "No endpoints to resolve"; return
     fi
-    local seen=() hp host
+    local seen=() hp host container_ok
     for hp in "${DOCKER_ENDPOINTS[@]}"; do
         host="${hp%%:*}"
         _in_list "$host" "${seen[@]:-}" && continue
         seen+=("$host")
+
+        # Check the container first: it's what actually runs the site. The
+        # host may use a different resolver/network path entirely (a
+        # lab-only hostname, a container-only network) and simply not have
+        # this name — that's not a site problem if the container resolves it.
+        if dexec getent hosts "$host" >/dev/null 2>&1; then
+            container_ok=true
+            log_ok "Container resolves: $host"
+        else
+            container_ok=false
+            log_warn "Container cannot resolve: $host"
+            add_issue "dns: container cannot resolve $host"
+        fi
+
         if nslookup "$host" &>/dev/null || dig +short "$host" 2>/dev/null | grep -q .; then
             log_ok "Host resolves: $host"
+        elif $container_ok; then
+            log_warn "Host cannot resolve $host, but the container resolves it fine. Likely a host-only DNS gap, not a site problem."
         else
             log_err "Host cannot resolve: $host"
             add_issue "dns: Cannot resolve $host from host"
-        fi
-        if dexec getent hosts "$host" >/dev/null 2>&1; then
-            log_ok "Container resolves: $host"
-        else
-            log_warn "Container cannot resolve: $host"
-            add_issue "dns: container cannot resolve $host"
         fi
     done
 }
@@ -3145,6 +3177,106 @@ docker_fix_oom() {
         fi
         log_err "docker update failed — recreate the container with: --memory $(human_bytes "$new")"
     fi
+    return 1
+}
+
+# A Windows Event Forwarding source stops at startup with "No checkpoint
+# store configured" on a Docker standalone site — the dataplane's checkpoint
+# settings aren't loaded from the Add Source form. Writes a small YAML file
+# and mounts it at /etc/dataplane/dataplane-globals.yaml (unsupported
+# workaround; confirm with SentinelOne for the supported fix on your
+# version). Requires a recreate — a mount can't be added to a running
+# container — so this follows the same Compose-aware recreate-with-backup
+# shape as the other recreate-based fixes.
+docker_fix_wef_checkpoint_store() {
+    local mount_dst="/etc/dataplane/dataplane-globals.yaml"
+
+    if dinspect '{{range .Mounts}}{{.Destination}}{{println}}{{end}}' | grep -qF "$mount_dst"; then
+        log_ok "A dataplane-globals.yaml is already mounted at $mount_dst"
+        echo "    If the WEF source is still failing, check its contents on the host."
+        return 1
+    fi
+
+    log_err "Root cause: a Windows Event Forwarding source has no checkpoint store configured"
+    echo "    This is a known product gap, not a misconfiguration — the Add Source form has"
+    echo "    no checkpoint field. The workaround below is unsupported; confirm with"
+    echo "    SentinelOne for your version before relying on it in production."
+    echo ""
+
+    local hostfile="$(_dpd_home)/.data-pipeline-doctor/dataplane-globals.yaml"
+    echo "    Will write $hostfile:"
+    echo -e "      ${DIM}data_dir: /var/observo/data/dataplane${NC}"
+    echo -e "      ${DIM}checkpoint:${NC}"
+    echo -e "      ${DIM}  store_path: /var/observo/data/dataplane/checkpoints.db3${NC}"
+    echo "    ...and mount it read-only at ${mount_dst} (requires a recreate)."
+    echo ""
+
+    if ! confirm "Write the checkpoint config and recreate $DOCKER_CONTAINER with it mounted?"; then
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$hostfile")" 2>/dev/null
+    cat > "$hostfile" <<'EOF'
+# Lab workaround: checkpoint store for the dataplane instance (WEF source needs one).
+# Mirrors /etc/collector-globals/collector-globals.yaml, with a separate db file.
+data_dir: /var/observo/data/dataplane
+checkpoint:
+  store_path: /var/observo/data/dataplane/checkpoints.db3
+EOF
+    # The container reads this as uid 1000. A host-written file can come out
+    # unreadable to it depending on the host user's uid (confirmed live: the
+    # same class of failure hit cert files mounted the same way, on a host
+    # where the invoking user wasn't uid 1000). Nothing here is a secret, so
+    # make it world-readable rather than trying to chown to a uid that may
+    # not even exist as a real user on this host.
+    chmod 644 "$hostfile" 2>/dev/null
+    # Under sudo, root wrote this into the real user's home (_dpd_home) —
+    # give it back to them so it's not a root-owned file sitting in their
+    # own home directory.
+    if [[ ${EUID:-$(id -u)} -eq 0 && -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+        chown "$SUDO_USER" "$hostfile" "$(dirname "$hostfile")" 2>/dev/null
+    fi
+
+    local compose_file=""
+    _dp_compose_info && compose_file="$DP_COMPOSE_FILE"
+
+    if [[ -n "$compose_file" ]]; then
+        local compose_backup="${compose_file}.bak.$(date +%Y%m%d%H%M%S)"
+        if ! cp "$compose_file" "$compose_backup"; then
+            log_err "Could not back up ${compose_file} — aborting."
+            return 1
+        fi
+        _dp_compose_add_mount "$compose_file" "$hostfile" "$mount_dst" "ro"
+        if docker compose -f "$compose_file" up -d >/dev/null 2>&1; then
+            log_fix "Mounted $hostfile at ${mount_dst} and recreated $DOCKER_CONTAINER."
+            log_info "Also updated ${compose_file} (backup: ${compose_backup}) so this survives a future recreate."
+            return 0
+        fi
+        log_err "docker compose up failed — restoring the previous ${compose_file}"
+        cp "$compose_backup" "$compose_file"
+        docker compose -f "$compose_file" up -d >/dev/null 2>&1
+        return 1
+    fi
+
+    DP_EXTRA_MOUNTS=("${hostfile}:${mount_dst}:ro")
+    _dp_build_run_cmd
+    local backup="${DOCKER_CONTAINER}_pre$(date +%s)"
+    if ! docker stop "$DOCKER_CONTAINER" >/dev/null 2>&1; then
+        log_err "Failed to stop container"; return 1
+    fi
+    if ! docker rename "$DOCKER_CONTAINER" "$backup" >/dev/null 2>&1; then
+        log_err "Failed to rename; container is stopped — start it again with: docker start $DOCKER_CONTAINER"
+        return 1
+    fi
+    if "${DP_RUN_CMD[@]}" >/dev/null 2>&1; then
+        log_fix "Recreated $DOCKER_CONTAINER with $hostfile mounted at ${mount_dst}. Backup: $backup"
+        echo -e "  ${DIM}Verify, then remove the backup: docker rm $backup${NC}"
+        return 0
+    fi
+    log_err "Recreate failed — rolling back to the previous container"
+    docker rm -f "$DOCKER_CONTAINER" >/dev/null 2>&1
+    docker rename "$backup" "$DOCKER_CONTAINER" >/dev/null 2>&1
+    docker start "$DOCKER_CONTAINER" >/dev/null 2>&1 && log_info "Rolled back; original container is running again."
     return 1
 }
 
@@ -3814,6 +3946,42 @@ _dp_compose_set_mem_limit() {
     fi
 }
 
+# Add a host-path volume mount to a Compose file's service, so a future
+# `docker compose up -d` doesn't silently drop it. Creates the service's
+# `volumes:` key if it's missing; idempotent (skips if the exact spec is
+# already present). mode is appended if non-empty (e.g. "ro"). Assumes the
+# single-service layout this tool generates (2-space service indent,
+# 4-space key indent under it) — the same assumption _dp_compose_add_port
+# makes. Unlike `ports:`, `volumes:` is also a legal TOP-LEVEL Compose key
+# (named-volume declarations), so the match below requires the exact
+# 4-space service-key indent rather than the looser `[[:space:]]*` other
+# compose-sync helpers use — a generic match would also fire on the
+# top-level `volumes:` block and corrupt it.
+_dp_compose_add_mount() {
+    local file="$1" host_path="$2" container_path="$3" mode="${4:-}"
+    local spec="${host_path}:${container_path}"
+    [[ -n "$mode" ]] && spec="${spec}:${mode}"
+
+    if grep -qF "${spec}" "$file"; then
+        return 0   # already present
+    fi
+    if grep -qE '^    volumes:[[:space:]]*$' "$file"; then
+        awk -v spec="$spec" '
+            { print }
+            /^    volumes:[[:space:]]*$/ && !done { print "      - \"" spec "\""; done=1 }
+        ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+    else
+        awk -v spec="$spec" '
+            { print }
+            /^[[:space:]]*container_name:/ && !done {
+                print "    volumes:"
+                print "      - \"" spec "\""
+                done=1
+            }
+        ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+    fi
+}
+
 # Reconstruct the `docker run` argv for the current container, adding extra -p
 # mappings ($@). Sets globals DP_RUN_CMD (array) and DP_ENV_FILE. Env is written
 # to a 0600 --env-file (HOSTNAME dropped so Docker assigns a fresh one) — secrets
@@ -3856,6 +4024,11 @@ _dp_build_run_cmd() {
 
     local np
     for np in "$@"; do DP_RUN_CMD+=(-p "$np"); done
+
+    local nm
+    for nm in "${DP_EXTRA_MOUNTS[@]}"; do DP_RUN_CMD+=(-v "$nm"); done
+    DP_EXTRA_MOUNTS=()   # consume so a mount never leaks into an unrelated later call
+
     DP_RUN_CMD+=("$image")
 }
 
@@ -4197,7 +4370,7 @@ docker_main_menu() {
         echo -e "    ${CYAN} 0)${NC} Exit"
         echo ""
         local choice
-        read -rp "  Choose [0-14]: " choice
+        read -rp "  Choose [0-14]: " choice || { echo ""; log_info "Goodbye."; exit 0; }
         case "$choice" in
             1)  docker_full_scan ;;
             2)  docker_run_scan docker_scan_services "Service Health (s6)" ;;

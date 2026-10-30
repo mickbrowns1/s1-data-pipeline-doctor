@@ -17,6 +17,48 @@ version string yet.
   Compose-managed site's `docker-compose.yml` in sync via a new
   `_dp_compose_add_mount` helper (same pattern as the source-ports and OOM
   Compose-sync fixes). (`ae0b190`, 2026-10-29)
+- WEF/WEC integration: a startup question (Docker sites only) asking
+  whether this host manages WEF/WEC-forwarding sites, remembered in
+  `~/.data-pipeline-doctor/profile`. When on, the Full diagnostic scan adds
+  a read-only WEF readiness section, and a new Docker menu option 15 offers
+  a read-only readiness check (source found, port published, checkpoint
+  store, cert readability, FIPS mode, last error, forwarders seen) plus
+  "Make this site WEF-ready" — applies the checkpoint store, cert mount,
+  and FIPS-disable fixes in one recreate. Adds `_dp_compose_set_env` (same
+  idempotent-awk pattern as the other Compose-sync helpers) and extends
+  `_dp_build_run_cmd` with a `DP_EXTRA_ENV` global for the raw-`docker run`
+  recreate path. (2026-10-30)
+- WEF/WEC follow-ups from the live Make-ready test (2026-10-30):
+  - A "yes" at startup now leads somewhere. Once the container is found,
+    Doctor checks WEF readiness and offers "Make it WEF-ready now? [Y/n]",
+    and the answer itself is acknowledged.
+  - The Full diagnostic scan raises a single `wef-not-ready` issue, and
+    the fix pass runs Make-ready for it. That replaces the checkpoint-only
+    fix, which used to leave the certs and FIPS broken.
+  - The host cert directory prompt defaults to `/etc/s1/wef` (the vendor
+    guide's path), or to the source's own cert folder when it exists on
+    the host.
+  - Turning FIPS off also updates `OPENSSL_CONF` in the Compose service's
+    `env_file`, backed up first, so it no longer disagrees with the
+    Compose override.
+  - Every private key in the cert folder is set to 600. Before, only the
+    first `.key` found was, and the rest stayed world-readable.
+  - Files written under sudo get the invoking user's group as well as
+    their owner.
+  - Every prompt exits cleanly on EOF, not just the two top-level menus.
+  - When Doctor runs without root against a root-owned Compose file, it
+    warns at startup. Make-ready stops with a `sudo` hint before it
+    writes anything.
+- WEF-ready new-site setup. With WEF/WEC mode on, a new Docker site is
+  built WEF-ready on its first start, with no later recreate. Setup asks
+  for the WEF listener port (default 5986) and publishes it. It mounts
+  `/etc/s1/wef` read-only, creating it owned by uid 1000, plus the
+  checkpoint store, and offers to turn FIPS off in the env file (with a
+  warning, default No). It finishes with next steps: certs still to copy,
+  the console source's listen address, callback and cert paths, the
+  Windows subscription manager string, and Tools 15 → 1 to verify.
+  Right after this setup, the startup readiness check is skipped, because
+  the console hasn't pushed the pipeline yet. (2026-10-30)
 
 ### Fixed
 

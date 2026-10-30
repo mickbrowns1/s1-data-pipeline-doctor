@@ -109,6 +109,7 @@ A Docker site is a single container (image `observo-standalone-site`) that runs 
 | 11 | **Proxy & connectivity** | Host + in-container egress tests and TLS verification to the site's endpoints |
 | 12 | **Source ports** | Show published ports (annotated by source type) and open a new one for a source — generates the `-p` mapping + recreate command (or recreates for you), plus firewall hints |
 | 13 | **Syslog tester** | Send a synthetic syslog event (Firewall, Auth, DNS, Web, or Generic) to a published source port on `localhost`. Embeds a unique UUID so you can locate the event in SDL with `message contains '<uuid>'` |
+| 15 | **WEF/WEC integration** | Read-only readiness check (source found, port published, checkpoint store, cert readability, FIPS mode, last error, forwarders seen) and a one-recreate "make this site WEF-ready" fix. Shows a live issue count in the menu when WEF mode is on (see below) |
 | 0 | **Exit** | |
 
 ### Opening source ports
@@ -124,6 +125,17 @@ A self-hosted site receives source data on **published container ports** (Syslog
 > The container-side port must match what the source listens on — that listener comes from configuring the source in the SentinelOne UI (e.g. a Syslog source's listen address `0.0.0.0:10001`). This tool opens the host-side plumbing so traffic can reach the container; data flows once both sides are set, in whichever order you do them.
 >
 > **HEC note:** HEC inputs are usually multiplexed over a single endpoint (the existing `8088`) with per-source tokens, so a new HEC source typically reuses `8088` rather than needing a new port. Open a new port when the source defines its own listener (common for Syslog).
+
+### WEF/WEC integration
+
+At startup, on a Docker site the tool asks once whether this host manages Windows Event Forwarding (WEF/WEC) sites, and remembers the answer (`~/.data-pipeline-doctor/profile`). When it's on, the Full diagnostic scan adds a read-only WEF readiness section, and the Docker menu's option 15 shows a live issue count.
+
+Option **15 → WEF/WEC integration**:
+
+1. **Readiness check (read-only).** Reports OK/WARN/FAIL for: WEF source found (listen address, callback), port published on the host, checkpoint store mounted, certificate files readable inside the container by uid 1000, crypto mode (flags FIPS as incompatible with WEF on image 2.46.0), the last WEF error seen in logs, and forwarders seen recently.
+2. **Make this site WEF-ready.** Diagnoses what's missing, shows the plan, and applies everything in **one recreate**: writes and mounts the checkpoint store, mounts your certificate files at the path the console source expects (asks where they currently live on the host — Doctor can't guess this), and disables FIPS-mode crypto if it's on (with its own explicit warning and confirmation, since that affects the whole site, not just WEF). Backs up the Compose file with a timestamped name first.
+
+> Three product gaps drive this: the dataplane has no default checkpoint store (WEF needs one to persist bookmarks), certificate files must be readable by the container's uid 1000, and WEF cannot build its TLS identity on image 2.46.0 with FIPS-mode crypto enabled. All three are confirmed against a real Docker standalone site, not just vendor documentation.
 
 ## Auto-Fix Capabilities
 

@@ -3225,15 +3225,19 @@ docker_fix_oom() {
 # ============================================================
 #  WEF/WEC integration — shared read-only helpers
 # ============================================================
-# Best-effort read of a WEF source's settings from inside the container's
-# own resolved config. `collector_address` is confirmed as the real internal
-# key name (it appears verbatim in the product's own startup error: "...and
-# collector_address is unset..."). The cert file paths are identified
-# generically (anything path-shaped ending in .crt/.key/.pem) rather than by
-# a specific key name, since the exact schema for that part hasn't been
-# confirmed against a live config file — only that the paths are "delivered"
-# into this file. Sets DP_WEF_FOUND, DP_WEF_LISTEN, DP_WEF_CALLBACK,
-# DP_WEF_CERT_PATHS (array, deduped).
+# Block-scoped read of a WEF source's settings from inside the container's
+# own resolved /etc/dataplane/config.yaml, confirmed against a real file on
+# a live site (2026-10-30). Keyed on `type: wef` as the block signal, not on
+# proximity to `collector_address:` — source keys are alphabetical, so
+# address: and collector_address: can be separated by an arbitrary-sized
+# auth: block (an earlier line-proximity version of this broke exactly this
+# way on the real file). Also reads the confirmed real cert key names
+# (auth.ca_file / auth.crt_file / auth.key_file) instead of a generic
+# path-shaped regex, so it can no longer sweep in cert paths belonging to a
+# different, non-WEF source. Assumes the real file's confirmed indent:
+# 2-space source-name line, 4-space keys under it, 6-space under auth:.
+# Reports the first WEF-typed source if more than one exists. Sets
+# DP_WEF_FOUND, DP_WEF_LISTEN, DP_WEF_CALLBACK, DP_WEF_CERT_PATHS (array).
 _dp_wef_read_config() {
     DP_WEF_FOUND=false
     DP_WEF_LISTEN=""
@@ -3243,21 +3247,38 @@ _dp_wef_read_config() {
     local cfg
     cfg=$(dexec sh -c "cat /etc/dataplane/config.yaml /etc/collector/config.yaml 2>/dev/null" 2>/dev/null)
     [[ -z "$cfg" ]] && return 1
-    echo "$cfg" | grep -q "collector_address" || return 1
 
-    DP_WEF_FOUND=true
-    # Field order relative to collector_address isn't confirmed, so look a
-    # few lines both before and after it rather than assuming address:
-    # comes after (a real stub config caught this the other way around).
-    DP_WEF_LISTEN=$(echo "$cfg" | grep -B5 -A5 -i "collector_address" | grep -E '^[[:space:]]*address:' \
-        | head -1 | sed 's/^[[:space:]]*address:[[:space:]]*//')
-    DP_WEF_CALLBACK=$(echo "$cfg" | grep -E 'collector_address:' | head -1 | sed 's/.*collector_address:[[:space:]]*//')
+    local parsed
+    parsed=$(echo "$cfg" | awk '
+        function flush() {
+            if (iswef) print "WEF_FOUND=1\nWEF_LISTEN=" addr "\nWEF_CALLBACK=" cb "\nWEF_CERTS=" certs
+            iswef=0; addr=""; cb=""; certs=""
+        }
+        /^sources:/ { insrc=1; next }
+        /^[^ ]/ { if (insrc) flush(); insrc=0 }
+        insrc && /^  [^ ]/ { flush(); next }
+        insrc && /^    type:[ ]*wef[ ]*$/ { iswef=1 }
+        insrc && /^    address:/ { sub(/^    address:[ ]*/,""); addr=$0 }
+        insrc && /^    collector_address:/ { sub(/^    collector_address:[ ]*/,""); cb=$0 }
+        insrc && /^      (ca|crt|key)_file:/ { sub(/^      [a-z]+_file:[ ]*/,""); certs=certs" "$0 }
+        END { if (insrc) flush() }
+    ')
+    [[ -z "$parsed" ]] && return 1
 
-    local path
-    while IFS= read -r path; do
-        [[ -n "$path" ]] && DP_WEF_CERT_PATHS+=("$path")
-    done < <(echo "$cfg" | grep -oE '/[A-Za-z0-9_./-]+\.(crt|key|pem)' | sort -u)
-    return 0
+    local line certstr c
+    while IFS= read -r line; do
+        case "$line" in
+            WEF_FOUND=*)    DP_WEF_FOUND=true ;;
+            WEF_LISTEN=*)   DP_WEF_LISTEN="${line#WEF_LISTEN=}" ;;
+            WEF_CALLBACK=*) DP_WEF_CALLBACK="${line#WEF_CALLBACK=}" ;;
+            WEF_CERTS=*)
+                certstr="${line#WEF_CERTS=}"
+                for c in $certstr; do DP_WEF_CERT_PATHS+=("$c"); done
+                ;;
+        esac
+    done <<< "$(echo "$parsed" | head -4)"   # first WEF source only, if more than one
+
+    $DP_WEF_FOUND
 }
 
 # Populates DP_WEF_REPORT (array of "LEVEL|message", LEVEL one of

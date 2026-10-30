@@ -4814,7 +4814,22 @@ docker_wef_make_ready() {
             fi
         fi
 
-        if docker compose -f "$compose_file" up -d >/dev/null 2>&1; then
+        # When only file permissions were wrong (the mount was already there),
+        # neither the compose file nor the env file changes, so `up -d` is a
+        # no-op. But the WEF source has already stopped on the cert error and
+        # doesn't retry, so the container still needs a restart.
+        local unchanged=false
+        cmp -s "$compose_file" "$compose_backup" \
+            && { [[ -z "$env_backup" ]] || cmp -s "$env_file" "$env_backup"; } && unchanged=true
+        if $unchanged; then
+            rm -f "$compose_backup" "${env_backup:-}"
+            if docker restart "$DOCKER_CONTAINER" >/dev/null 2>&1; then
+                log_fix "Restarted $DOCKER_CONTAINER so the WEF source starts with the fixed certificate permissions (no config change was needed)."
+            else
+                log_err "Could not restart $DOCKER_CONTAINER — run: docker restart $DOCKER_CONTAINER"
+                $inline || pause; return 1
+            fi
+        elif docker compose -f "$compose_file" up -d >/dev/null 2>&1; then
             log_fix "Recreated $DOCKER_CONTAINER with the WEF changes applied."
             log_info "Previous compose file saved as ${compose_backup}"
             [[ -n "$env_backup" ]] && log_info "Previous env file saved as ${env_backup}"

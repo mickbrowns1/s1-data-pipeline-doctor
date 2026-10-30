@@ -13,6 +13,7 @@ DETECTED_ISSUES=()
 DP_EXTRA_MOUNTS=()   # set by a caller before _dp_build_run_cmd to add -v mounts; consumed (cleared) by it
 DP_EXTRA_ENV=()       # set by a caller before _dp_build_run_cmd to add KEY=value env lines; consumed (cleared) by it
 WEF_MODE=false        # does this host manage WEF/WEC-forwarding sites? asked once at startup, saved to a profile file
+DP_WEF_FIPS_ON=false  # set by _dp_wef_check
 
 # --- Site type (kubernetes | docker) ---
 SITE_TYPE=""                                     # chosen at startup
@@ -263,7 +264,7 @@ splash() {
     echo " ══════════════════════════════════════════   ♥  Doctor v1.6"
     echo -e "${NC}${DIM}   Site diagnostics & remediation  ·  K8s + Docker  ·  SentinelOne${NC}"
     echo ""
-    read -rp "  Press Enter to begin..." _
+    read -rp "  Press Enter to begin..." _ || _dpd_eof_exit
 }
 
 # Slim nameplate — redrawn on every menu screen.
@@ -276,16 +277,32 @@ banner() {
     echo ""
 }
 
+# stdin closed (piped input ran out, Ctrl-D, ssh dropped) — exit instead of
+# letting a menu loop redraw forever on a read that can never succeed.
+_dpd_eof_exit() {
+    echo ""
+    log_info "Input closed — exiting."
+    exit 0
+}
+
 pause() {
     echo ""
-    read -rp "  Press Enter to continue..." _
+    read -rp "  Press Enter to continue..." _ || _dpd_eof_exit
 }
 
 confirm() {
     local msg="${1:-Apply this fix?}"
     echo ""
-    read -rp "  ${msg} [y/N] " ans
+    read -rp "  ${msg} [y/N] " ans || _dpd_eof_exit
     [[ "$ans" =~ ^[Yy]$ ]]
+}
+
+# Same as confirm, but Enter means yes — for the recommended next step.
+confirm_yes() {
+    local msg="$1"
+    echo ""
+    read -rp "  ${msg} [Y/n] " ans || _dpd_eof_exit
+    [[ -z "$ans" || "$ans" =~ ^[Yy]$ ]]
 }
 
 pick_one() {
@@ -299,7 +316,7 @@ pick_one() {
     done
     echo "" >&2
     local choice
-    read -rp "  Choose [1-${#options[@]}]: " choice
+    read -rp "  Choose [1-${#options[@]}]: " choice || _dpd_eof_exit
     echo "$choice"
 }
 
@@ -365,6 +382,7 @@ preflight() {
     if [[ "$SITE_TYPE" == "docker" ]]; then
         _dpd_load_wef_mode || _dpd_ask_wef_mode   # WEF/WEC support is Docker-only; ask once, then remember
         docker_preflight
+        _dpd_wef_startup_check
     else
         preflight_k8s
     fi
@@ -379,7 +397,7 @@ preflight_k8s() {
     if ! kc cluster-info &>/dev/null; then
         log_err "Cannot connect to Kubernetes cluster"
         echo "  Set KUBECONFIG or pass the path when prompted."
-        read -rp "  Kubeconfig path: " KUBECONFIG
+        read -rp "  Kubeconfig path: " KUBECONFIG || _dpd_eof_exit
         if ! kc cluster-info &>/dev/null; then
             log_err "Still cannot connect. Exiting."
             exit 1
@@ -1020,7 +1038,7 @@ pod_debug_menu() {
         echo ""
 
         local action
-        read -rp "  Choose [0-9]: " action
+        read -rp "  Choose [0-9]: " action || _dpd_eof_exit
 
         case "$action" in
             1)
@@ -1342,7 +1360,7 @@ except Exception as e:
     echo ""
 
     local choice
-    read -rp "  Select component to tap [0-${#all_items[@]}]: " choice
+    read -rp "  Select component to tap [0-${#all_items[@]}]: " choice || _dpd_eof_exit
 
     [[ "$choice" == "0" || -z "$choice" ]] && return
     if ! [[ "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 || "$choice" -gt ${#all_items[@]} ]]; then
@@ -1365,7 +1383,7 @@ except Exception as e:
     echo ""
 
     local mode
-    read -rp "  Choose [0-2]: " mode
+    read -rp "  Choose [0-2]: " mode || _dpd_eof_exit
 
     case "$mode" in
         1)
@@ -1381,7 +1399,7 @@ except Exception as e:
             ;;
         2)
             echo ""
-            read -rp "  Duration in seconds [60]: " duration
+            read -rp "  Duration in seconds [60]: " duration || _dpd_eof_exit
             duration="${duration:-60}"
 
             echo ""
@@ -1588,7 +1606,7 @@ menu_proxy_connectivity() {
 
     local cdn_token="${CDN_TOKEN:-}"
     if [[ -z "$cdn_token" ]]; then
-        read -rp "  Enter CDN token (or press Enter to skip): " cdn_token
+        read -rp "  Enter CDN token (or press Enter to skip): " cdn_token || _dpd_eof_exit
     fi
 
     if [[ -n "$cdn_token" ]]; then
@@ -1837,7 +1855,7 @@ menu_proxy_connectivity() {
 
         if confirm "Patch proxy env vars into pods now?"; then
             local proxy_url
-            read -rp "  Enter proxy URL (e.g. http://proxy.corp:8080): " proxy_url
+            read -rp "  Enter proxy URL (e.g. http://proxy.corp:8080): " proxy_url || _dpd_eof_exit
             [[ -n "$proxy_url" ]] && _apply_proxy_patch "$proxy_url"
         fi
 
@@ -1904,8 +1922,10 @@ run_all_fixes() {
     local tls_fixed=false
     local conn_fixed=false
     local docker_init_blocked=false
+    local wef_bundle=false
     for issue in "${DETECTED_ISSUES[@]:-}"; do
         [[ "$issue" == docker-init:* ]] && docker_init_blocked=true
+        [[ "$issue" == wef-not-ready:* ]] && wef_bundle=true
     done
 
     for issue in "${DETECTED_ISSUES[@]}"; do
@@ -1935,8 +1955,15 @@ run_all_fixes() {
                 fi
                 ;;
             wef-checkpoint-store:*)
-                if [[ "$SITE_TYPE" == "docker" ]]; then
+                # wef-not-ready's Make-ready includes the checkpoint store;
+                # doing it here too would cost a second recreate.
+                if [[ "$SITE_TYPE" == "docker" ]] && ! $wef_bundle; then
                     docker_fix_wef_checkpoint_store && { ((fixed++)) || true; }
+                fi
+                ;;
+            wef-not-ready:*)
+                if [[ "$SITE_TYPE" == "docker" ]]; then
+                    docker_wef_make_ready inline && { ((fixed++)) || true; }
                 fi
                 ;;
             docker-svc-down:*)
@@ -2294,7 +2321,7 @@ fix_connectivity() {
     else
         if confirm "Patch proxy env vars into pods now?"; then
             local proxy_url
-            read -rp "  Enter proxy URL (e.g. http://proxy.corp:8080): " proxy_url
+            read -rp "  Enter proxy URL (e.g. http://proxy.corp:8080): " proxy_url || _dpd_eof_exit
             [[ -n "$proxy_url" ]] && _apply_proxy_patch "$proxy_url" && return 0
         fi
     fi
@@ -2393,7 +2420,7 @@ docker_setup_new_site() {
             echo "      0) Skip ports"
             echo
             local port_choice
-            read -rp "    Choose [0-6]: " port_choice
+            read -rp "    Choose [0-6]: " port_choice || _dpd_eof_exit
             [[ "$port_choice" == "0" ]] && break
 
             local port_spec
@@ -2404,7 +2431,7 @@ docker_setup_new_site() {
                 4) port_spec="8088:8088" ;;
                 5) port_spec="9092:9092" ;;
                 6)
-                    read -rp "    Enter port mapping (host:container[/proto]): " port_spec
+                    read -rp "    Enter port mapping (host:container[/proto]): " port_spec || _dpd_eof_exit
                     [[ -z "$port_spec" ]] && continue
                     ;;
                 *) log_warn "Invalid choice"; continue ;;
@@ -2549,7 +2576,8 @@ _dpd_home() {
 # outside sudo. Matches the home-resolution rule in _dpd_home above.
 _dpd_chown_back() {
     [[ ${EUID:-$(id -u)} -eq 0 && -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]] || return 0
-    chown "$SUDO_USER" "$@" 2>/dev/null
+    # user:group, not just user — otherwise the file keeps root's group.
+    chown "$SUDO_USER:$(id -gn "$SUDO_USER" 2>/dev/null)" "$@" 2>/dev/null
 }
 
 # A small global profile (not per-site) remembering whether this host
@@ -2581,6 +2609,41 @@ _dpd_ask_wef_mode() {
     if [[ "$ans" =~ ^[Yy] ]]; then WEF_MODE=true; else WEF_MODE=false; fi
     echo "wef=${WEF_MODE}" > "$pf" 2>/dev/null
     _dpd_chown_back "$pf" "$dir"
+    if $WEF_MODE; then
+        log_ok "WEF/WEC mode on — this site will be checked for WEF readiness once its container is found."
+    else
+        log_info "WEF/WEC mode off — Tools 15 is still available if you need it later."
+    fi
+    echo -e "  ${DIM}Saved to ${pf} (edit or delete it to change the answer).${NC}"
+}
+
+# Runs right after docker_preflight when WEF/WEC mode is on, so a "yes" at
+# startup leads straight to the fix instead of waiting to be found under
+# Tools 15. Read-only unless the user accepts the Make-ready offer.
+_dpd_wef_startup_check() {
+    $WEF_MODE || return 0
+    [[ "$(dinspect '{{.State.Running}}')" == "true" ]] || return 0
+    _dp_wef_check
+    echo ""
+    if ! $DP_WEF_FOUND; then
+        log_info "WEF/WEC: no Windows Event Forwarding source in this site's pipeline yet."
+        echo -e "  ${DIM}Add one in the console, then use Tools 15 → Make this site WEF-ready.${NC}"
+        pause
+        return 0
+    fi
+    if [[ $DP_WEF_ISSUES -eq 0 ]] && ! $DP_WEF_FIPS_ON; then
+        log_ok "WEF/WEC: this site is WEF-ready."
+        return 0
+    fi
+    echo -e "  ${BOLD}WEF/WEC readiness — $DOCKER_CONTAINER${NC}"
+    echo ""
+    _dp_wef_print_report
+    if confirm_yes "This site isn't WEF-ready yet. Make it WEF-ready now?"; then
+        docker_wef_make_ready
+    else
+        log_info "Skipped — run it later from Tools 15 → 2."
+        pause
+    fi
 }
 
 # Prompt for the .env contents directly instead of waiting on a file copy —
@@ -2819,6 +2882,13 @@ docker_preflight() {
     fi
     [[ "$(dinspect '{{.State.Running}}')" != "true" ]] && \
         log_warn "Container '$DOCKER_CONTAINER' is not running — some checks will be limited"
+
+    # Scans work without root (docker group), but every fix that rewrites the
+    # Compose file fails if Doctor created it under sudo. Say so up front.
+    if [[ ${EUID:-$(id -u)} -ne 0 ]] && _dp_compose_info && [[ ! -w "$DP_COMPOSE_FILE" ]]; then
+        log_warn "Not running as root — $DP_COMPOSE_FILE isn't writable by $(id -un), so fixes that recreate the container will fail."
+        echo -e "  ${DIM}Scans still work. For fixes, re-run with:  sudo $0${NC}"
+    fi
 
     detect_host_ca
     docker_load_endpoints
@@ -3289,6 +3359,7 @@ _dp_wef_check() {
     DP_WEF_REPORT=()
     DP_WEF_ISSUES=0
     DP_WEF_WARNINGS=0
+    DP_WEF_FIPS_ON=false   # a WARN, not a FAIL (it's a policy choice), but Make-ready still fixes it
 
     _dp_wef_read_config
     if $DP_WEF_FOUND; then
@@ -3349,6 +3420,7 @@ _dp_wef_check() {
     else
         DP_WEF_REPORT+=("WARN|FIPS mode is likely on — WEF fails to start on image 2.46.0 with FIPS enabled (PKCS12KDF). See 'Make this site WEF-ready'.")
         ((DP_WEF_WARNINGS++))
+        DP_WEF_FIPS_ON=true
     fi
 
     # Last WEF runtime error + forwarders seen (informational)
@@ -3473,7 +3545,7 @@ docker_fix_restart_service() {
     local svc="$1" ch
     log_warn "Service down: $svc"
     echo "    1) Restart just this service (s6-svc)   2) Restart whole container   3) Skip"
-    read -rp "  Choose [1-3]: " ch
+    read -rp "  Choose [1-3]: " ch || _dpd_eof_exit
     case "$ch" in
         1)  if dexec s6-svc -r "/run/service/$svc" 2>/dev/null || dexec s6-svc -du "/run/service/$svc" 2>/dev/null; then
                 log_fix "Requested restart of service $svc"; return 0
@@ -3502,14 +3574,18 @@ docker_full_scan() {
     docker_scan_storage;       hr
     docker_scan_resources;     hr
     if $WEF_MODE; then
-        # Informational only here — most WEF readiness items don't have a
-        # dispatcher entry in run_all_fixes (only wef-checkpoint-store does,
-        # already raised by docker_scan_service_logs above). "Make this site
-        # WEF-ready" in the WEF/WEC Integration menu is the actual fix path.
+        # Any readiness gap is raised as one wef-not-ready issue, fixed by
+        # "Make this site WEF-ready" — one recreate covering the checkpoint
+        # store, certs and FIPS. It supersedes wef-checkpoint-store (raised by
+        # docker_scan_service_logs above), so the fix pass doesn't fix one of
+        # three and leave WEF still broken.
         echo -e "  ${BOLD}WEF/WEC readiness${NC}"
         echo ""
         _dp_wef_check
         _dp_wef_print_report
+        if $DP_WEF_FOUND && { [[ $DP_WEF_ISSUES -gt 0 ]] || $DP_WEF_FIPS_ON; }; then
+            add_issue "wef-not-ready: $DOCKER_CONTAINER is not WEF-ready (${DP_WEF_ISSUES} blocking issue(s)$($DP_WEF_FIPS_ON && echo ', FIPS on'))"
+        fi
         hr
     fi
 
@@ -3595,7 +3671,7 @@ docker_menu_logs() {
         echo ""
         echo -e "    ${CYAN}0)${NC}  Back"
         echo ""
-        local ch; read -rp "  Choose [0-4]: " ch
+        local ch; read -rp "  Choose [0-4]: " ch || _dpd_eof_exit
         case "$ch" in
             1)  dk logs "$DOCKER_CONTAINER" --tail 200 2>&1 | less -R ;;
             2)  echo -e "  ${DIM}── Ctrl+C to stop ──${NC}"; echo ""; dk logs -f --tail 50 "$DOCKER_CONTAINER" 2>&1 || true; pause ;;
@@ -3617,7 +3693,7 @@ docker_menu_restart() {
     echo ""
     echo -e "    ${CYAN}0)${NC}  Back"
     echo ""
-    local ch; read -rp "  Choose [0-2]: " ch
+    local ch; read -rp "  Choose [0-2]: " ch || _dpd_eof_exit
     case "$ch" in
         1)  local svcs arr=() s c svc
             svcs=$(svc_list)
@@ -3654,7 +3730,7 @@ docker_service_debug_menu() {
         echo ""
         echo -e "    ${CYAN}0)${NC}  Back"
         echo ""
-        local ch s; read -rp "  Choose [0-5]: " ch
+        local ch s; read -rp "  Choose [0-5]: " ch || _dpd_eof_exit
         case "$ch" in
             1)  echo ""; while IFS= read -r s; do
                     [[ -z "$s" ]] && continue
@@ -3893,7 +3969,7 @@ docker_menu_dataplane_tap() {
         hr; echo ""
         echo -e "    ${CYAN}s)${NC} $($expanded && echo 'Hide' || echo 'Show') internal sinks & transforms     ${CYAN}0)${NC} Back"
         echo ""
-        read -rp "  Select component to tap [0-${#all_kinds[@]}]: " choice
+        read -rp "  Select component to tap [0-${#all_kinds[@]}]: " choice || _dpd_eof_exit
         [[ "$choice" == "0" || -z "$choice" ]] && return
         if [[ "$choice" == "s" || "$choice" == "S" ]]; then
             $expanded && expanded=false || expanded=true
@@ -4301,14 +4377,14 @@ docker_menu_source_ports() {
         *) return ;;
     esac
     if [[ -z "$proto" ]]; then
-        read -rp "  Protocol [tcp/udp] (default tcp): " proto; proto="${proto:-tcp}"
+        read -rp "  Protocol [tcp/udp] (default tcp): " proto || _dpd_eof_exit; proto="${proto:-tcp}"
     fi
     # One prompt, docker-style. Accepts:  HOST  |  HOST:CONTAINER  |  with optional /tcp|/udp
     # If only HOST is given, the container port defaults to the same number.
     local input hport cport
     echo -e "  ${DIM}Enter the mapping as host[:container] — e.g. ${NC}10001${DIM} or ${NC}10001:10001${DIM} (container port"
     echo -e "  must match the source's listen port; defaults to the host port).${NC}"
-    read -rp "  Port mapping${sugg:+ (default $sugg)}: " input; input="${input:-$sugg}"
+    read -rp "  Port mapping${sugg:+ (default $sugg)}: " input || _dpd_eof_exit; input="${input:-$sugg}"
     input="${input// /}"                                  # tolerate stray spaces
     if [[ "$input" == */* ]]; then proto="${input##*/}"; input="${input%%/*}"; fi   # optional /proto override
     if [[ "$input" == *:* ]]; then hport="${input%%:*}"; cport="${input##*:}"; else hport="$input"; cport="$input"; fi
@@ -4445,15 +4521,39 @@ docker_wef_menu_readiness() {
 # Compose-sync / raw-run-recreate pattern as the other fixes. The cert
 # source directory on the host isn't guessable — Doctor asks for it rather
 # than assuming a path.
+# Path the vendor WEF guide uses for the server cert, key and CA. Absent from
+# the 2.46.0 image, so mounting here can't shadow anything the site ships.
+DP_WEF_CERT_DIR_DEFAULT="/etc/s1/wef"
+
+# The env_file a Compose service reads (first one), or nothing. Used so the
+# FIPS switch is written where operators look for it, not only as a Compose
+# override that silently disagrees with the env file.
+_dp_compose_env_file() {
+    local file="$1" ef
+    ef=$(awk '/^[[:space:]]*env_file:[[:space:]]*[^[:space:]]/ { sub(/^[[:space:]]*env_file:[[:space:]]*/, ""); gsub(/["'\'']/, ""); print; exit }' "$file")
+    [[ -z "$ef" ]] && return 0
+    [[ "$ef" == /* ]] || ef="$(dirname "$file")/$ef"   # Compose resolves relative paths from the file's dir
+    echo "$ef"
+}
+
+# $1 = "inline" when called from the full scan's fix pass: no banner (it would
+# clear the scan output) and no pauses (the scan pauses once at the end).
+# Returns 0 only when the site was changed.
 docker_wef_make_ready() {
-    banner
-    echo -e "  ${BOLD}Make this site WEF-ready — $DOCKER_CONTAINER${NC}"
+    local inline=false
+    [[ "${1:-}" == "inline" ]] && inline=true
+    if $inline; then
+        log_info "Make this site WEF-ready — $DOCKER_CONTAINER"
+    else
+        banner
+        echo -e "  ${BOLD}Make this site WEF-ready — $DOCKER_CONTAINER${NC}"
+    fi
     echo ""
     _dp_wef_check
 
     if ! $DP_WEF_FOUND; then
         log_err "No WEF source found in the dataplane config — add the Windows Event Forwarding source in the console first."
-        pause; return
+        $inline || pause; return 1
     fi
 
     local need_checkpoint=false need_certs=false need_fips=false
@@ -4469,13 +4569,27 @@ docker_wef_make_ready() {
         done
     fi
 
-    local opensslconf
-    opensslconf=$(dinspect '{{range .Config.Env}}{{println .}}{{end}}' | grep '^OPENSSL_CONF=' | cut -d= -f2-)
-    [[ "$opensslconf" == *openssl.cnf.default ]] || need_fips=true
+    $DP_WEF_FIPS_ON && need_fips=true
 
     if ! $need_checkpoint && ! $need_certs && ! $need_fips; then
         log_ok "Already WEF-ready — nothing to do."
-        pause; return
+        $inline || pause; return 1
+    fi
+
+    # Every change below ends in rewriting the Compose/env files (root-owned
+    # when Doctor set the site up under sudo) or recreating the container.
+    # Fail here with the fix, not half-way through after writing files.
+    local compose_file="" env_file=""
+    _dp_compose_info && compose_file="$DP_COMPOSE_FILE"
+    if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+        local blocked=""
+        [[ -n "$compose_file" && ! -w "$compose_file" ]] && blocked="$compose_file"
+        [[ -z "$blocked" && -n "$compose_file" && ! -w "$(dirname "$compose_file")" ]] && blocked="$(dirname "$compose_file")"
+        if [[ -n "$blocked" ]]; then
+            log_err "Not running as root, and $blocked isn't writable by $(id -un)."
+            echo -e "  ${DIM}Re-run Doctor with sudo:  sudo $0${NC}"
+            $inline || pause; return 1
+        fi
     fi
 
     echo "  Plan:"
@@ -4494,21 +4608,25 @@ docker_wef_make_ready() {
 
     local cert_src_dir="" cert_dst_dir=""
     if $need_certs; then
-        echo -e "  ${YELLOW}Where are the server certificate, key, and CA file on THIS host right now?${NC}"
-        echo "    (the folder containing them, e.g. /opt/s1-wef)"
-        read -rp "  Host cert directory: " cert_src_dir
-        if [[ -z "$cert_src_dir" || ! -d "$cert_src_dir" ]]; then
-            log_err "No valid directory given — aborting."
-            pause; return
-        fi
+        # Container side: wherever the console source points, else the guide's path.
         if [[ ${#DP_WEF_CERT_PATHS[@]} -gt 0 ]]; then
             cert_dst_dir="$(dirname "${DP_WEF_CERT_PATHS[0]}")"
-        else
-            read -rp "  Container-side path the source expects these files at (e.g. /etc/s1/wef): " cert_dst_dir
-            if [[ -z "$cert_dst_dir" ]]; then
-                log_err "No destination path given — aborting."
-                pause; return
-            fi
+        fi
+        # Host side defaults to the same path when it exists, so host and
+        # container match like in the guide; otherwise the guide's path.
+        local src_default="$DP_WEF_CERT_DIR_DEFAULT"
+        [[ -n "$cert_dst_dir" && -d "$cert_dst_dir" ]] && src_default="$cert_dst_dir"
+        echo -e "  ${YELLOW}Where are the server certificate, key, and CA file on THIS host right now?${NC}"
+        echo "    (the folder containing them — Enter for ${src_default})"
+        read -rp "  Host cert directory [${src_default}]: " cert_src_dir || _dpd_eof_exit
+        cert_src_dir="${cert_src_dir:-$src_default}"
+        if [[ ! -d "$cert_src_dir" ]]; then
+            log_err "$cert_src_dir is not a directory — copy the certs there first, or enter where they are. Aborting."
+            $inline || pause; return 1
+        fi
+        if [[ -z "$cert_dst_dir" ]]; then
+            read -rp "  Container-side path the source expects these files at [${DP_WEF_CERT_DIR_DEFAULT}]: " cert_dst_dir || _dpd_eof_exit
+            cert_dst_dir="${cert_dst_dir:-$DP_WEF_CERT_DIR_DEFAULT}"
         fi
     fi
 
@@ -4522,9 +4640,14 @@ docker_wef_make_ready() {
         fi
     fi
 
+    if ! $need_checkpoint && ! $need_certs && ! $need_fips; then
+        log_info "Nothing left to apply."
+        $inline || pause; return 1
+    fi
+
     echo ""
     if ! confirm "Apply the plan above and recreate $DOCKER_CONTAINER now (one recreate, existing container backed up)?"; then
-        pause; return
+        $inline || pause; return 1
     fi
 
     local hostfile="$(_dpd_home)/.data-pipeline-doctor/dataplane-globals.yaml"
@@ -4542,38 +4665,55 @@ EOF
     fi
 
     if $need_certs; then
-        chmod -R a+r "$cert_src_dir" 2>/dev/null
-        local keyfile
-        keyfile=$(find "$cert_src_dir" -iname "*.key" 2>/dev/null | head -1)
-        [[ -n "$keyfile" ]] && chmod 600 "$keyfile" 2>/dev/null
-        if [[ $(_dpd_sudo) == "sudo" ]]; then
-            sudo chown -R 1000:1000 "$cert_src_dir" 2>/dev/null
-        else
-            chown -R 1000:1000 "$cert_src_dir" 2>/dev/null
-        fi
+        # The container runs as uid 1000: it owns the files, certs stay
+        # world-readable (they're public), and every private key is 600 —
+        # not just the first one found.
+        local s
+        s=$(_dpd_sudo)
+        $s find "$cert_src_dir" -type d -exec chmod 755 {} + 2>/dev/null
+        $s find "$cert_src_dir" -type f -exec chmod 644 {} + 2>/dev/null
+        $s find "$cert_src_dir" -type f \( -iname '*.key' -o -iname '*key*.pem' -o -iname '*.p12' -o -iname '*.pfx' \) \
+            -exec chmod 600 {} + 2>/dev/null
+        $s chown -R 1000:1000 "$cert_src_dir" 2>/dev/null
     fi
 
-    local compose_file=""
-    _dp_compose_info && compose_file="$DP_COMPOSE_FILE"
-
     if [[ -n "$compose_file" ]]; then
-        local compose_backup="${compose_file}.bak.$(date +%Y%m%d%H%M%S)"
-        if ! cp "$compose_file" "$compose_backup"; then
+        local stamp compose_backup env_backup=""
+        stamp="$(date +%Y%m%d%H%M%S)"
+        compose_backup="${compose_file}.bak.${stamp}"
+        if ! cp -p "$compose_file" "$compose_backup"; then
             log_err "Could not back up ${compose_file} — aborting."
-            pause; return
+            $inline || pause; return 1
         fi
         $need_checkpoint && _dp_compose_add_mount "$compose_file" "$hostfile" "/etc/dataplane/dataplane-globals.yaml" "ro"
         $need_certs && _dp_compose_add_mount "$compose_file" "$cert_src_dir" "$cert_dst_dir" "ro"
-        $need_fips && _dp_compose_set_env "$compose_file" "OPENSSL_CONF" "/etc/ssl/openssl.cnf.default"
+        if $need_fips; then
+            _dp_compose_set_env "$compose_file" "OPENSSL_CONF" "/etc/ssl/openssl.cnf.default"
+            # Keep the env file in step with the Compose override, so nobody
+            # reads OPENSSL_CONF=...fips there and thinks FIPS is still on.
+            env_file="$(_dp_compose_env_file "$compose_file")"
+            if [[ -n "$env_file" && -f "$env_file" ]] && grep -qE '^OPENSSL_CONF=' "$env_file"; then
+                env_backup="${env_file}.bak.${stamp}"
+                if cp -p "$env_file" "$env_backup"; then
+                    sed -i.dpdtmp 's#^OPENSSL_CONF=.*#OPENSSL_CONF=/etc/ssl/openssl.cnf.default#' "$env_file" \
+                        && rm -f "${env_file}.dpdtmp"
+                else
+                    env_backup=""
+                    log_warn "Could not back up ${env_file} — left it unchanged (the Compose override still applies)."
+                fi
+            fi
+        fi
 
         if docker compose -f "$compose_file" up -d >/dev/null 2>&1; then
             log_fix "Recreated $DOCKER_CONTAINER with the WEF changes applied."
             log_info "Previous compose file saved as ${compose_backup}"
+            [[ -n "$env_backup" ]] && log_info "Previous env file saved as ${env_backup}"
         else
             log_err "docker compose up failed — restoring the previous ${compose_file}"
-            cp "$compose_backup" "$compose_file"
+            cp -p "$compose_backup" "$compose_file"
+            [[ -n "$env_backup" ]] && cp -p "$env_backup" "$env_file"
             docker compose -f "$compose_file" up -d >/dev/null 2>&1
-            pause; return
+            $inline || pause; return 1
         fi
     else
         DP_EXTRA_MOUNTS=()
@@ -4585,11 +4725,11 @@ EOF
 
         local backup="${DOCKER_CONTAINER}_pre$(date +%s)"
         if ! docker stop "$DOCKER_CONTAINER" >/dev/null 2>&1; then
-            log_err "Failed to stop container"; pause; return
+            log_err "Failed to stop container"; $inline || pause; return 1
         fi
         if ! docker rename "$DOCKER_CONTAINER" "$backup" >/dev/null 2>&1; then
             log_err "Failed to rename; container is stopped — start it again with: docker start $DOCKER_CONTAINER"
-            pause; return
+            $inline || pause; return 1
         fi
         if "${DP_RUN_CMD[@]}" >/dev/null 2>&1; then
             log_fix "Recreated $DOCKER_CONTAINER with the WEF changes applied. Backup: $backup"
@@ -4598,7 +4738,7 @@ EOF
             docker rm -f "$DOCKER_CONTAINER" >/dev/null 2>&1
             docker rename "$backup" "$DOCKER_CONTAINER" >/dev/null 2>&1
             docker start "$DOCKER_CONTAINER" >/dev/null 2>&1 && log_info "Rolled back; original container is running again."
-            pause; return
+            $inline || pause; return 1
         fi
     fi
 
@@ -4608,7 +4748,8 @@ EOF
     echo ""
     _dp_wef_check
     _dp_wef_print_report
-    pause
+    $inline || pause
+    return 0
 }
 
 docker_menu_wef() {
@@ -4763,7 +4904,7 @@ docker_menu_syslog_stream() {
 
     # Interval between events (default 1s).
     local rate
-    read -rp "  Seconds between events [1]: " rate
+    read -rp "  Seconds between events [1]: " rate || _dpd_eof_exit
     [[ -z "$rate" ]] && rate=1
     if [[ ! "$rate" =~ ^[0-9]+$ ]] || [[ "$rate" -lt 1 ]]; then
         log_warn "Invalid interval — using 1 second."

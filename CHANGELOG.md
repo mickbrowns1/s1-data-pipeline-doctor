@@ -28,6 +28,27 @@ version string yet.
   idempotent-awk pattern as the other Compose-sync helpers) and extends
   `_dp_build_run_cmd` with a `DP_EXTRA_ENV` global for the raw-`docker run`
   recreate path. (2026-10-30)
+- WEF/WEC follow-ups from the live Make-ready test (2026-10-30):
+  - A "yes" at startup now leads somewhere. Once the container is found,
+    Doctor checks WEF readiness and offers "Make it WEF-ready now? [Y/n]",
+    and the answer itself is acknowledged.
+  - The Full diagnostic scan raises a single `wef-not-ready` issue, and
+    the fix pass runs Make-ready for it. That replaces the checkpoint-only
+    fix, which used to leave the certs and FIPS broken.
+  - The host cert directory prompt defaults to `/etc/s1/wef` (the vendor
+    guide's path), or to the source's own cert folder when it exists on
+    the host.
+  - Turning FIPS off also updates `OPENSSL_CONF` in the Compose service's
+    `env_file`, backed up first, so it no longer disagrees with the
+    Compose override.
+  - Every private key in the cert folder is set to 600. Before, only the
+    first `.key` found was, and the rest stayed world-readable.
+  - Files written under sudo get the invoking user's group as well as
+    their owner.
+  - Every prompt exits cleanly on EOF, not just the two top-level menus.
+  - When Doctor runs without root against a root-owned Compose file, it
+    warns at startup. Make-ready stops with a `sudo` hint before it
+    writes anything.
 
 ### Fixed
 

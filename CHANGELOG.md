@@ -49,6 +49,16 @@ version string yet.
   - When Doctor runs without root against a root-owned Compose file, it
     warns at startup. Make-ready stops with a `sudo` hint before it
     writes anything.
+- WEF-ready new-site setup. With WEF/WEC mode on, a new Docker site is
+  built WEF-ready on its first start, with no later recreate. Setup asks
+  for the WEF listener port (default 5986) and publishes it. It mounts
+  `/etc/s1/wef` read-only, creating it owned by uid 1000, plus the
+  checkpoint store, and offers to turn FIPS off in the env file (with a
+  warning, default No). It finishes with next steps: certs still to copy,
+  the console source's listen address, callback and cert paths, the
+  Windows subscription manager string, and Tools 15 → 1 to verify.
+  Right after this setup, the startup readiness check is skipped, because
+  the console hasn't pushed the pipeline yet. (2026-10-30)
 
 ### Fixed
 

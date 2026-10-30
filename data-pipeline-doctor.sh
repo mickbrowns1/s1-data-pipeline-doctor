@@ -14,6 +14,7 @@ DP_EXTRA_MOUNTS=()   # set by a caller before _dp_build_run_cmd to add -v mounts
 DP_EXTRA_ENV=()       # set by a caller before _dp_build_run_cmd to add KEY=value env lines; consumed (cleared) by it
 WEF_MODE=false        # does this host manage WEF/WEC-forwarding sites? asked once at startup, saved to a profile file
 DP_WEF_FIPS_ON=false  # set by _dp_wef_check
+DP_NEW_SITE_WEF=false # set when docker_setup_new_site built this site WEF-ready this run
 
 # --- Site type (kubernetes | docker) ---
 SITE_TYPE=""                                     # chosen at startup
@@ -2404,10 +2405,48 @@ docker_setup_new_site() {
     fi
     echo
 
+    # WEF/WEC mode: build the site WEF-ready from the first start (port,
+    # checkpoint store, cert mount, optional FIPS-off) instead of creating it
+    # bare and recreating it later via Make-ready. The console source usually
+    # doesn't exist yet at this point, so nothing here depends on it.
+    local port_specs=() wef_mounts=() wef_port="" wef_cert_dir=""
+    if $WEF_MODE; then
+        echo "  WEF/WEC — preparing this site for Windows Event Forwarding"
+        echo
+        while true; do
+            read -rp "    WEF listener port [${DP_WEF_PORT_DEFAULT}]: " wef_port || _dpd_eof_exit
+            wef_port="${wef_port:-$DP_WEF_PORT_DEFAULT}"
+            [[ "$wef_port" =~ ^[0-9]+$ && "$wef_port" -ge 1 && "$wef_port" -le 65535 ]] && break
+            log_warn "Enter a port number (1-65535)"
+        done
+        port_specs+=("${wef_port}:${wef_port}/tcp")
+        log_ok "Added: ${wef_port}:${wef_port}/tcp (use the same port in the console source's listen address)"
+
+        wef_cert_dir="$DP_WEF_CERT_DIR_DEFAULT"
+        _dp_wef_fix_cert_perms "$wef_cert_dir"
+        wef_mounts+=("${wef_cert_dir}:${wef_cert_dir}:ro")
+        log_ok "Certificate folder: ${wef_cert_dir} (mounted read-only at the same path)"
+
+        local cp_file; cp_file="$(_dp_wef_checkpoint_file)"
+        _dp_wef_write_checkpoint_store "$cp_file"
+        wef_mounts+=("${cp_file}:/etc/dataplane/dataplane-globals.yaml:ro")
+        log_ok "Checkpoint store: ${cp_file}"
+
+        echo
+        echo -e "    ${RED}${BOLD}FIPS warning:${NC} WEF can't start with FIPS-mode crypto on (image 2.46.0, PKCS12KDF)."
+        echo "    Turning it off applies to the WHOLE site. Don't do this in a FedRAMP/DoD or other FIPS-required environment."
+        if confirm "Disable FIPS-validated crypto for this site?"; then
+            _dp_env_set_openssl_conf "$env_file" "/etc/ssl/openssl.cnf.default"
+            log_ok "Set OPENSSL_CONF=/etc/ssl/openssl.cnf.default in $env_file"
+        else
+            log_warn "FIPS left on — the WEF source will fail to start until it's turned off (Tools 15 → 2)."
+        fi
+        echo
+    fi
+
     # Step 3: Ask about ports (optional)
-    local port_specs=()
     echo "  Step 3 — Configure source listener ports (optional)"
-    if confirm "Add source listener ports now?"; then
+    if confirm "Add${wef_port:+ more} source listener ports now?"; then
         while true; do
             echo
             echo "    Port mapping presets:"
@@ -2470,6 +2509,10 @@ services:
     volumes:
       - observo-data:/var/observo/data
 COMPOSE
+        local m
+        for m in "${wef_mounts[@]+"${wef_mounts[@]}"}"; do
+            echo "      - \"$m\"" >> "$compose_file"
+        done
         if [[ ${#port_specs[@]} -gt 0 ]]; then
             echo "    ports:" >> "$compose_file"
             for spec in "${port_specs[@]}"; do
@@ -2502,6 +2545,10 @@ COMPOSE
                 docker_flags+=("-p" "$spec")
             done
         fi
+        local m
+        for m in "${wef_mounts[@]+"${wef_mounts[@]}"}"; do
+            docker_flags+=("-v" "$m")
+        done
         if docker run -d \
             --name observo-standalone-site \
             --env-file "$env_file" \
@@ -2516,6 +2563,12 @@ COMPOSE
         fi
     fi
     echo
+
+    if $WEF_MODE; then
+        _dp_wef_print_next_steps "$wef_port" "$wef_cert_dir"
+        DP_NEW_SITE_WEF=true
+        pause
+    fi
 
     DOCKER_CONTAINER="observo-standalone-site"
     return 0
@@ -2622,6 +2675,9 @@ _dpd_ask_wef_mode() {
 # Tools 15. Read-only unless the user accepts the Make-ready offer.
 _dpd_wef_startup_check() {
     $WEF_MODE || return 0
+    # Just built WEF-ready by docker_setup_new_site, which already printed the
+    # next steps; its pipeline (and WEF source) won't have arrived yet.
+    $DP_NEW_SITE_WEF && return 0
     [[ "$(dinspect '{{.State.Running}}')" == "true" ]] || return 0
     _dp_wef_check
     echo ""
@@ -4524,6 +4580,76 @@ docker_wef_menu_readiness() {
 # Path the vendor WEF guide uses for the server cert, key and CA. Absent from
 # the 2.46.0 image, so mounting here can't shadow anything the site ships.
 DP_WEF_CERT_DIR_DEFAULT="/etc/s1/wef"
+DP_WEF_PORT_DEFAULT=5986
+
+# Host-side checkpoint store for the WEF source, mounted at
+# /etc/dataplane/dataplane-globals.yaml. Shared by new-site setup and Make-ready.
+_dp_wef_checkpoint_file() { echo "$(_dpd_home)/.data-pipeline-doctor/dataplane-globals.yaml"; }
+
+_dp_wef_write_checkpoint_store() {
+    local hostfile="$1"
+    mkdir -p "$(dirname "$hostfile")" 2>/dev/null
+    cat > "$hostfile" <<'EOF'
+# Lab workaround: checkpoint store for the dataplane instance (WEF source needs one).
+# Mirrors /etc/collector-globals/collector-globals.yaml, with a separate db file.
+data_dir: /var/observo/data/dataplane
+checkpoint:
+  store_path: /var/observo/data/dataplane/checkpoints.db3
+EOF
+    chmod 644 "$hostfile" 2>/dev/null
+    _dpd_chown_back "$hostfile" "$(dirname "$hostfile")"
+}
+
+# The container runs as uid 1000: it owns the cert files, certs stay
+# world-readable (they're public), and every private key is 600 — not just
+# the first one found. Creates the directory if it doesn't exist yet.
+_dp_wef_fix_cert_perms() {
+    local dir="$1" s
+    s=$(_dpd_sudo)
+    $s mkdir -p "$dir" 2>/dev/null
+    $s find "$dir" -type d -exec chmod 755 {} + 2>/dev/null
+    $s find "$dir" -type f -exec chmod 644 {} + 2>/dev/null
+    $s find "$dir" -type f \( -iname '*.key' -o -iname '*key*.pem' -o -iname '*.p12' -o -iname '*.pfx' \) \
+        -exec chmod 600 {} + 2>/dev/null
+    $s chown -R 1000:1000 "$dir" 2>/dev/null
+}
+
+# Set OPENSSL_CONF in a site env file (replace the line, or append it).
+_dp_env_set_openssl_conf() {
+    local env_file="$1" value="$2"
+    if grep -qE '^OPENSSL_CONF=' "$env_file"; then
+        sed -i.dpdtmp "s#^OPENSSL_CONF=.*#OPENSSL_CONF=${value}#" "$env_file" && rm -f "${env_file}.dpdtmp"
+    else
+        echo "OPENSSL_CONF=${value}" >> "$env_file"
+    fi
+}
+
+# Shown at the end of new-site setup in WEF/WEC mode: the steps Doctor
+# can't do for the customer (their certs, the console source).
+_dp_wef_print_next_steps() {
+    local port="$1" cert_dir="$2" fqdn f missing=()
+    fqdn="$(hostname -f 2>/dev/null || hostname)"
+    for f in ca.crt server.crt server.key; do
+        $(_dpd_sudo) test -f "$cert_dir/$f" 2>/dev/null || missing+=("$f")
+    done
+    echo -e "  ${BOLD}WEF/WEC — next steps${NC}"
+    echo ""
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo "    1. Copy the server certificate, key, and CA into ${cert_dir}:"
+        echo "         ${missing[*]}"
+        echo "       Then re-run Doctor (or Tools 15 → 2) to set ownership for the container."
+    else
+        echo "    1. Certificates found in ${cert_dir} — ownership set for the container."
+    fi
+    echo "    2. In the console, add a Windows Event Forwarding source to this site:"
+    echo "         Listen address:     0.0.0.0:${port}"
+    echo "         Collector address:  ${fqdn}:${port}   (the name Windows forwarders resolve)"
+    echo "         CA / cert / key:    ${cert_dir}/ca.crt, ${cert_dir}/server.crt, ${cert_dir}/server.key"
+    echo "    3. Point the Windows subscription manager at:"
+    echo "         Server=https://${fqdn}:${port}/wsman/SubscriptionManager/WEC,Refresh=60,IssuerCA=<CA thumbprint>"
+    echo "    4. Check it with Tools 15 → 1 (readiness check) once the source is deployed."
+    echo ""
+}
 
 # The env_file a Compose service reads (first one), or nothing. Used so the
 # FIPS switch is written where operators look for it, not only as a Compose
@@ -4650,32 +4776,10 @@ docker_wef_make_ready() {
         $inline || pause; return 1
     fi
 
-    local hostfile="$(_dpd_home)/.data-pipeline-doctor/dataplane-globals.yaml"
-    if $need_checkpoint; then
-        mkdir -p "$(dirname "$hostfile")" 2>/dev/null
-        cat > "$hostfile" <<'EOF'
-# Lab workaround: checkpoint store for the dataplane instance (WEF source needs one).
-# Mirrors /etc/collector-globals/collector-globals.yaml, with a separate db file.
-data_dir: /var/observo/data/dataplane
-checkpoint:
-  store_path: /var/observo/data/dataplane/checkpoints.db3
-EOF
-        chmod 644 "$hostfile" 2>/dev/null
-        _dpd_chown_back "$hostfile" "$(dirname "$hostfile")"
-    fi
-
-    if $need_certs; then
-        # The container runs as uid 1000: it owns the files, certs stay
-        # world-readable (they're public), and every private key is 600 —
-        # not just the first one found.
-        local s
-        s=$(_dpd_sudo)
-        $s find "$cert_src_dir" -type d -exec chmod 755 {} + 2>/dev/null
-        $s find "$cert_src_dir" -type f -exec chmod 644 {} + 2>/dev/null
-        $s find "$cert_src_dir" -type f \( -iname '*.key' -o -iname '*key*.pem' -o -iname '*.p12' -o -iname '*.pfx' \) \
-            -exec chmod 600 {} + 2>/dev/null
-        $s chown -R 1000:1000 "$cert_src_dir" 2>/dev/null
-    fi
+    local hostfile
+    hostfile="$(_dp_wef_checkpoint_file)"
+    $need_checkpoint && _dp_wef_write_checkpoint_store "$hostfile"
+    $need_certs && _dp_wef_fix_cert_perms "$cert_src_dir"
 
     if [[ -n "$compose_file" ]]; then
         local stamp compose_backup env_backup=""
@@ -4695,8 +4799,7 @@ EOF
             if [[ -n "$env_file" && -f "$env_file" ]] && grep -qE '^OPENSSL_CONF=' "$env_file"; then
                 env_backup="${env_file}.bak.${stamp}"
                 if cp -p "$env_file" "$env_backup"; then
-                    sed -i.dpdtmp 's#^OPENSSL_CONF=.*#OPENSSL_CONF=/etc/ssl/openssl.cnf.default#' "$env_file" \
-                        && rm -f "${env_file}.dpdtmp"
+                    _dp_env_set_openssl_conf "$env_file" "/etc/ssl/openssl.cnf.default"
                 else
                     env_backup=""
                     log_warn "Could not back up ${env_file} — left it unchanged (the Compose override still applies)."

@@ -10,6 +10,22 @@ version string yet.
 
 ### Added
 
+- WEF/WEC menu (Tools 15), options 3–5 (2026-10-30):
+  - **Windows forwarder setup.** Shows the site's collector address, CA
+    thumbprint and subscription manager string, plus the steps for each
+    Windows forwarder. It can write `wef-forwarder-setup.ps1`, which is
+    ASCII-only so Windows PowerShell 5.1 parses it, and safe to re-run on
+    a configured forwarder. The script was run on a live forwarder.
+  - **TLS endpoint test.** Checks the certificate's SAN, CA chain, key
+    match, expiry and EKU, does a verified handshake on the container
+    port, and checks the published host port. It uses the container's
+    OpenSSL.
+  - **Forwarder activity.** Shows, per forwarder, connections and
+    last-seen time; events in total and per hour; TLS handshake failures
+    by cause; and recent WEF errors. The parser works with POSIX awk.
+  - The cert install helper from the original design was dropped: the
+    console can't select certificates placed on the host, so it wouldn't
+    help.
 - Auto-fix for a Windows Event Forwarding source that fails to start with
   "No checkpoint store configured" on a Docker standalone site: writes a
   `dataplane-globals.yaml` and mounts it at

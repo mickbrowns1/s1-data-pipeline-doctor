@@ -120,6 +120,23 @@ version string yet.
 
 ### Fixed
 
+- New Site Setup's Syslog TCP/TLS/UDP port presets published the host port
+  to a *different* container port (`514:10514`, assuming a privileged-port
+  remap inside the container). That assumption was wrong: the dataplane
+  binds directly to whatever address the console source is configured
+  with — a source on `0.0.0.0:514` is a real process bound to literal port
+  514 inside the container (confirmed via the owning PID's open file
+  descriptors), not 10514. The old preset left nothing listening on the
+  published side, so Syslog UDP traffic silently vanished with no error
+  anywhere — the tester still reported success since UDP sends don't
+  confirm delivery, and nothing showed up in SDL. Presets now publish the
+  same port on both sides (`1514:1514`, `6514:6514`, `514:514/udp`),
+  matching what the Source ports menu (option 12) already did correctly.
+  The Syslog tester's own port picker had the same remap assumption baked
+  into its matching logic and has been fixed the same way: a port is only
+  offered if the container-side port literally equals a configured
+  source's address port. Found and fixed live after a real test event
+  sent to a `514:10514` mapping never reached SDL. (2026-11-02)
 - OOM memory-limit fix now also updates `docker-compose.yml`'s `mem_limit`
   (and `memswap_limit`, if set) when the site is Compose-managed, so a live
   memory bump survives a future `docker compose up -d` recreate instead of

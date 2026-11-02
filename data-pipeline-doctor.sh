@@ -2454,9 +2454,9 @@ docker_setup_new_site() {
         while true; do
             echo
             echo "    Port mapping presets:"
-            echo "      1) Syslog TCP (514:10514)"
-            echo "      2) Syslog TLS (514:10514/tls)"
-            echo "      3) Syslog UDP (514:10514/udp)"
+            echo "      1) Syslog TCP (1514:1514)"
+            echo "      2) Syslog TLS (6514:6514)"
+            echo "      3) Syslog UDP (514:514/udp)"
             echo "      4) HEC push (8088:8088)"
             echo "      5) Kafka (9092:9092)"
             echo "      6) Custom"
@@ -2466,11 +2466,19 @@ docker_setup_new_site() {
             read -rp "    Choose [0-6]: " port_choice || _dpd_eof_exit
             [[ "$port_choice" == "0" ]] && break
 
+            # Host and container port match — the dataplane binds directly to
+            # whatever address the console source is configured with, no
+            # internal remap to a different port (confirmed live: a source
+            # configured for 0.0.0.0:514 is a real PID bound to literal port
+            # 514 inside the container, not some other port — publishing
+            # host:514 to a *different* container port left nothing
+            # listening on the published side, so UDP traffic silently
+            # vanished with no error anywhere. 2026-11-02).
             local port_spec
             case "$port_choice" in
-                1) port_spec="514:10514" ;;
-                2) port_spec="514:10514" ;;  # TLS handled by container config
-                3) port_spec="514:10514/udp" ;;
+                1) port_spec="1514:1514" ;;
+                2) port_spec="6514:6514" ;;  # TLS handled by container config
+                3) port_spec="514:514/udp" ;;
                 4) port_spec="8088:8088" ;;
                 5) port_spec="9092:9092" ;;
                 6)
@@ -5444,16 +5452,22 @@ _dp_syslog_read_config() {
 #
 # Gated on _dp_syslog_read_config finding at least one real socket source —
 # no bare "(custom)" fallback for an arbitrary published port anymore.
-# Matching a config source's address: port to the container port a host
-# port is actually published on isn't a plain equality check: a privileged
-# port the console lets you choose (e.g. 514/udp) gets remapped to an
-# unprivileged one inside the container (confirmed live: address: 0.0.0.0:514
-# in config, but the container is actually bound to 10514/udp, published to
-# host port 514 — 2026-11-02). _dp_port_role already encodes that exact,
-# previously-confirmed 514<->10514(UDP)/514<->1514(TCP) shape, so a published
-# port matches if either _dp_port_role recognizes its container port as
-# Syslog*, or its container port number literally equals a configured
-# source's address port (covers any non-privileged, non-remapped port).
+# Matching requires the published container port to literally equal the
+# source's own configured address port — no remap fudging. An earlier
+# version of this function (and the New Site Setup port presets) assumed
+# a privileged port like 514/udp gets remapped to an unprivileged one
+# inside the container (e.g. 10514/udp) and matched either number. That
+# assumption was wrong: the dataplane binds directly to the literal
+# configured address — a source on 0.0.0.0:514 is a real process bound to
+# port 514 inside the container, confirmed via the owning PID's open file
+# descriptors, not some other port. A host:514 -> container:10514 mapping
+# (from the old preset) left nothing listening on the published side, so
+# UDP traffic silently vanished — no error anywhere, success reported
+# locally regardless, confirmed live only after cross-checking in SDL.
+# _dp_port_role's static table is display-only now (used by Source ports
+# to label an existing mapping); it no longer drives this picker, since
+# it would otherwise offer the exact broken 514->10514 shape this fixes.
+# (2026-11-02)
 _dp_pick_syslog_port() {
     _dp_syslog_read_config
     if [[ ${#DP_SYSLOG_KEYS[@]} -eq 0 ]]; then
@@ -5463,38 +5477,30 @@ _dp_pick_syslog_port() {
     fi
 
     local entries=() hports=() protos=() keys=() hip hport cport role label
-    local i cfgport mode match rawport altport
+    local i cfgport mode match rawport
     while IFS='|' read -r hip hport cport; do
         [[ -z "$cport" ]] && continue
-        role="$(_dp_port_role "$cport" "$hport")"
         rawport="${cport%%/*}"
-        # Same privileged-port remap _dp_port_role already encodes (514<->10514
-        # UDP, 514<->1514 TCP) — checked here too so the matched source's own
-        # key (and its pipeline name) can still be found in the remap case.
-        altport="$rawport"
-        case "$rawport" in
-            10514) altport=514 ;;
-            1514)  altport=514 ;;
-        esac
 
         match=false
         for i in "${!DP_SYSLOG_KEYS[@]}"; do
             cfgport="${DP_SYSLOG_ADDR[$i]##*:}"
-            if [[ "$cfgport" == "$rawport" || "$cfgport" == "$altport" ]]; then
+            if [[ "$cfgport" == "$rawport" ]]; then
                 match=true; mode="${DP_SYSLOG_MODE[$i]}"; break
             fi
         done
+        $match || continue
 
+        role="$(_dp_port_role "$cport" "$hport")"
         if [[ "$role" == Syslog* ]]; then
             label="host ${hport} → container ${cport}  (${role})"
         else
-            $match || continue
             label="host ${hport} → container ${cport}  (Syslog ${mode^^})"
         fi
         entries+=("$label")
         hports+=("$hport")
         protos+=("${cport##*/}")
-        keys+=("$($match && echo "${DP_SYSLOG_KEYS[$i]}")")
+        keys+=("${DP_SYSLOG_KEYS[$i]}")
     done < <(dinspect '{{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostIp}}|{{.HostPort}}|{{$p}}{{println}}{{end}}{{end}}')
 
     if [[ ${#entries[@]} -eq 0 ]]; then

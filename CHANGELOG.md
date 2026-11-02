@@ -17,6 +17,20 @@ version string yet.
 
 ### Added
 
+- HEC tester (Tools 16) and HEC stream (Tools 17), mirroring the Syslog
+  tester/stream pair (options 13–14) but for Splunk HEC-push sources: send
+  a real `POST /services/collector/event` to a published HEC port, either
+  once or on a loop, reading the source's address, TLS flag, and token
+  straight from `/etc/dataplane/config.yaml` the same read-only way
+  `_dp_wef_read_config` does for WEF. Both only find a source if one is
+  actually configured — with none, they say so and point at adding a HEC
+  source in the console, same as the Syslog tester does when no
+  syslog-capable port is published. When more than one HEC source is
+  configured, offers a picker; when exactly one is found and published,
+  auto-selects it. The token is read to build the request's `Authorization`
+  header but is never printed. Verified against a live site with two HEC
+  sources: both sent (HTTP 200), and a deliberately wrong token was
+  rejected (HTTP 401). (2026-11-02)
 - WEF/WEC menu (Tools 15), options 3–5 (2026-10-30):
   - **Windows forwarder setup.** Shows the site's collector address, CA
     thumbprint and subscription manager string, plus the steps for each

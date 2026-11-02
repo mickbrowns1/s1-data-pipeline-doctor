@@ -5244,6 +5244,128 @@ docker_menu_wef() {
     done
 }
 
+# ============================================================
+#  HEC push integration — shared read-only helper
+# ============================================================
+# Block-scoped read of every `type: splunk_hec` source under `sources:` in
+# the container's own resolved /etc/dataplane/config.yaml, confirmed against
+# a real file on a live site (2026-11-02) — same approach as
+# _dp_wef_read_config. Deliberately does NOT match `splunk_hec_logs`, which
+# is an outbound sink (destination), not a push source, and lives under
+# `sinks:`, not `sources:`. Sets three parallel arrays, one entry per HEC
+# source found: DP_HEC_KEYS (source key), DP_HEC_ADDR (container-side
+# "host:port" from its address: line), DP_HEC_TLS (its tls.enabled value,
+# "false" if no tls: block is present), DP_HEC_TOKEN (first entry under
+# valid_tokens:). Never prints a token — callers that need it read it from
+# DP_HEC_TOKEN directly and must not echo it back to the console.
+_dp_hec_read_config() {
+    DP_HEC_KEYS=()
+    DP_HEC_ADDR=()
+    DP_HEC_TLS=()
+    DP_HEC_TOKEN=()
+
+    local cfg
+    cfg=$(dexec sh -c "cat /etc/dataplane/config.yaml /etc/collector/config.yaml 2>/dev/null" 2>/dev/null)
+    [[ -z "$cfg" ]] && return 1
+
+    local parsed
+    parsed=$(echo "$cfg" | awk '
+        function flush() {
+            if (ishec) print "HEC_KEY=" key "\nHEC_ADDR=" addr "\nHEC_TLS=" tls "\nHEC_TOKEN=" token "\nHEC_END=1"
+            ishec=0; key=""; addr=""; tls="false"; token=""
+        }
+        /^sources:/ { insrc=1; next }
+        /^[^ ]/ { if (insrc) flush(); insrc=0 }
+        insrc && /^  [^ ]/ {
+            flush()
+            k=$0; sub(/^  /,"",k); sub(/:[ ]*$/,"",k); gsub(/"/,"",k); key=k
+            next
+        }
+        insrc && /^    type:[ ]*splunk_hec[ ]*$/ { ishec=1 }
+        insrc && /^    address:/ { sub(/^    address:[ ]*/,""); addr=$0 }
+        insrc && /^      enabled:/ { sub(/^      enabled:[ ]*/,""); tls=$0 }
+        insrc && /^    - / && token=="" { sub(/^    - /,""); gsub(/"/,"",$0); token=$0 }
+        END { if (insrc) flush() }
+    ')
+    [[ -z "$parsed" ]] && return 1
+
+    local line key="" addr="" tls="false" token=""
+    while IFS= read -r line; do
+        case "$line" in
+            HEC_KEY=*)   key="${line#HEC_KEY=}" ;;
+            HEC_ADDR=*)  addr="${line#HEC_ADDR=}" ;;
+            HEC_TLS=*)   tls="${line#HEC_TLS=}" ;;
+            HEC_TOKEN=*) token="${line#HEC_TOKEN=}" ;;
+            HEC_END=*)
+                DP_HEC_KEYS+=("$key"); DP_HEC_ADDR+=("$addr")
+                DP_HEC_TLS+=("$tls"); DP_HEC_TOKEN+=("$token")
+                key=""; addr=""; tls="false"; token=""
+                ;;
+        esac
+    done <<< "$parsed"
+
+    [[ ${#DP_HEC_KEYS[@]} -gt 0 ]]
+}
+
+# Pick a published, HEC-push-capable source for the current container.
+# Sets DP_HEC_PORT, DP_HEC_TOKEN_SEL, DP_HEC_TLS_SEL on success; returns 1 on
+# cancel / none found. Auto-selects when only one candidate.
+# Deliberately scoped to sources the config + host port bindings both agree
+# on — a HEC source with no published host port can't be tested yet, so it's
+# excluded here rather than offered and failing later.
+_dp_pick_hec_source() {
+    _dp_hec_read_config
+    if [[ ${#DP_HEC_KEYS[@]} -eq 0 ]]; then
+        log_warn "No HEC push source found in this site's pipeline."
+        echo -e "  ${DIM}Add a Splunk HEC-push source in the console first.${NC}"
+        pause; return 1
+    fi
+
+    local entries=() hports=() tokens=() tlsflags=()
+    local i cport hip hport cport2 matched_hport tls_tag
+    for i in "${!DP_HEC_KEYS[@]}"; do
+        cport="${DP_HEC_ADDR[$i]##*:}"
+        [[ "$cport" =~ ^[0-9]+$ ]] || continue
+        matched_hport=""
+        while IFS='|' read -r hip hport cport2; do
+            [[ -z "$cport2" ]] && continue
+            [[ "${cport2%%/*}" == "$cport" ]] && matched_hport="$hport"
+        done < <(dinspect '{{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostIp}}|{{.HostPort}}|{{$p}}{{println}}{{end}}{{end}}')
+        [[ -z "$matched_hport" ]] && continue
+
+        tls_tag=""
+        [[ "${DP_HEC_TLS[$i]}" == "true" ]] && tls_tag=" · TLS"
+        entries+=("host ${matched_hport} → container ${cport}  (HEC push${tls_tag})")
+        hports+=("$matched_hport")
+        tokens+=("${DP_HEC_TOKEN[$i]}")
+        tlsflags+=("${DP_HEC_TLS[$i]}")
+    done
+
+    if [[ ${#entries[@]} -eq 0 ]]; then
+        log_warn "Found a HEC source in the config, but its container port isn't published on the host."
+        echo -e "  ${DIM}Use option 12 — Source ports to publish it first.${NC}"
+        pause; return 1
+    fi
+
+    if [[ ${#entries[@]} -eq 1 ]]; then
+        DP_HEC_PORT="${hports[0]}"; DP_HEC_TOKEN_SEL="${tokens[0]}"; DP_HEC_TLS_SEL="${tlsflags[0]}"
+        log_info "Using the only available HEC source: host ${DP_HEC_PORT}"
+        echo ""
+        return 0
+    fi
+
+    local src_count="${#entries[@]}" src_choice
+    entries+=("Back")
+    src_choice=$(pick_one "Which HEC source to send to?" "${entries[@]}")
+    if [[ ! "$src_choice" =~ ^[0-9]+$ || "$src_choice" -gt "$src_count" || "$src_choice" -lt 1 ]]; then
+        return 1
+    fi
+    DP_HEC_PORT="${hports[$(( src_choice - 1 ))]}"
+    DP_HEC_TOKEN_SEL="${tokens[$(( src_choice - 1 ))]}"
+    DP_HEC_TLS_SEL="${tlsflags[$(( src_choice - 1 ))]}"
+    return 0
+}
+
 # Pick a syslog-capable published port for the current container.
 # Sets DP_SYSLOG_PORT and DP_SYSLOG_PROTO on success; returns 1 on cancel / none found.
 # Auto-selects when only one candidate, otherwise offers a menu.
@@ -5420,6 +5542,126 @@ docker_menu_syslog_stream() {
     pause
 }
 
+# Build a Splunk HEC /services/collector/event JSON body with uuid embedded
+# in the event text, so the test event is findable the same way the syslog
+# tester's events are: 'message contains <uuid>' in SDL Event ALL Search.
+_dp_hec_event_body() {
+    local uuid="$1"
+    printf '{"event":"dpd HEC test event test-id=%s","sourcetype":"dpd:test"}' "$uuid"
+}
+
+# Send one HEC test event. $1 = uuid  $2 = port  $3 = token  $4 = tls (true|false)
+# Never echoes the token — it goes straight into the curl arg vector, never
+# printed. -k accepts a self-signed cert; this is a connectivity/auth probe,
+# not a certificate validator (TLS & certificates, option 4, covers that).
+_dp_send_hec() {
+    local uuid="$1" port="$2" token="$3" tls="$4" scheme="http"
+    [[ "$tls" == "true" ]] && scheme="https"
+    local code
+    code=$(curl -s -o /dev/null -w '%{http_code}' -k --connect-timeout 5 --max-time 10 \
+        -X POST "${scheme}://localhost:${port}/services/collector/event" \
+        -H "Authorization: Splunk ${token}" \
+        -H "Content-Type: application/json" \
+        -d "$(_dp_hec_event_body "$uuid")" 2>/dev/null || echo "000")
+    echo "$code"
+}
+
+docker_menu_hec_test() {
+    banner
+    echo -e "  ${BOLD}HEC Tester — $DOCKER_CONTAINER${NC}"
+    echo ""
+
+    _dp_pick_hec_source || return
+    local port="$DP_HEC_PORT" token="$DP_HEC_TOKEN_SEL" tls="$DP_HEC_TLS_SEL"
+    local scheme="http"; [[ "$tls" == "true" ]] && scheme="https"
+
+    local UUID code
+    UUID="$(_dp_gen_uuid)"
+
+    echo ""
+    log_info "Sending to ${scheme}://localhost:${port}/services/collector/event"
+    echo ""
+
+    code="$(_dp_send_hec "$UUID" "$port" "$token" "$tls")"
+    case "$code" in
+        2*)
+            log_ok "HEC accepted the event (HTTP ${code})."
+            echo -e "  ${DIM}Watch it arrive: Docker menu option 10 — Tail sources & destinations.${NC}"
+            echo ""
+            echo "Use the following in SDL Event ALL Search to locate the test event: message contains '${UUID}'"
+            echo ""
+            ;;
+        403|401)
+            log_err "HEC rejected the event (HTTP ${code}) — the token read from the dataplane config doesn't match what the endpoint expects."
+            ;;
+        000)
+            log_err "Failed to reach the HEC endpoint — check that the port is published and a listener is up."
+            ;;
+        *)
+            log_err "HEC returned HTTP ${code} — unexpected response."
+            ;;
+    esac
+    pause
+}
+
+# Continuous generator: send a fresh HEC event every N seconds until Ctrl-C.
+# Same rationale as docker_menu_syslog_stream — a steady trickle keeps a log
+# preview / dataplane tap non-idle instead of racing one-shot sends.
+docker_menu_hec_stream() {
+    banner
+    echo -e "  ${BOLD}HEC Stream (continuous) — $DOCKER_CONTAINER${NC}"
+    echo ""
+
+    _dp_pick_hec_source || return
+    local port="$DP_HEC_PORT" token="$DP_HEC_TOKEN_SEL" tls="$DP_HEC_TLS_SEL"
+    local scheme="http"; [[ "$tls" == "true" ]] && scheme="https"
+
+    local rate
+    read -rp "  Seconds between events [1]: " rate || _dpd_eof_exit
+    [[ -z "$rate" ]] && rate=1
+    if [[ ! "$rate" =~ ^[0-9]+$ ]] || [[ "$rate" -lt 1 ]]; then
+        log_warn "Invalid interval — using 1 second."
+        rate=1
+    fi
+
+    local UUID
+    UUID="$(_dp_gen_uuid)"
+
+    echo ""
+    log_info "Streaming HEC events to ${scheme}://localhost:${port}/services/collector/event every ${rate}s."
+    echo -e "  ${DIM}Open a log preview / Tail (option 10) in the Observo UI now — press Ctrl-C to stop.${NC}"
+    echo -e "  ${DIM}Find this batch in SDL Event ALL Search: message contains '${UUID}'${NC}"
+    echo ""
+
+    local sent=0 fails=0 stop=0 code
+    trap 'stop=1' INT
+    while [[ "$stop" -eq 0 ]]; do
+        code="$(_dp_send_hec "$UUID" "$port" "$token" "$tls")"
+        if [[ "$code" =~ ^2 ]]; then
+            sent=$(( sent + 1 ))
+        else
+            fails=$(( fails + 1 ))
+        fi
+        printf "\r  ${DIM}sent %d   failed %d${NC}   " "$sent" "$fails"
+        [[ "$stop" -eq 1 ]] && break
+        sleep "$rate"
+    done
+    trap - INT
+
+    echo ""
+    echo ""
+    if [[ "$sent" -gt 0 ]]; then
+        if [[ "$fails" -gt 0 ]]; then
+            log_ok "Stream stopped — ${sent} event(s) sent, ${fails} failed."
+        else
+            log_ok "Stream stopped — ${sent} event(s) sent."
+        fi
+    else
+        log_err "Stream stopped — no events sent (${fails} failed). Check the port is published, the token is valid, and a listener is up."
+    fi
+    pause
+}
+
 docker_main_menu() {
     while true; do
         banner
@@ -5445,13 +5687,14 @@ docker_main_menu() {
             [[ $DP_WEF_ISSUES -gt 0 ]] && wef_label="WEF/WEC integration (${DP_WEF_ISSUES} issue$([[ $DP_WEF_ISSUES -eq 1 ]] || echo s))"
         fi
         printf "    ${CYAN}%2s)${NC} %s\n" 15 "$wef_label"
+        printf "    ${CYAN}%2s)${NC} %-30s ${CYAN}%2s)${NC} %s\n" 16 "HEC tester" 17 "HEC stream (continuous)"
         echo ""
         hr
         echo ""
         echo -e "    ${CYAN} 0)${NC} Exit"
         echo ""
         local choice
-        read -rp "  Choose [0-15]: " choice || { echo ""; log_info "Goodbye."; exit 0; }
+        read -rp "  Choose [0-17]: " choice || { echo ""; log_info "Goodbye."; exit 0; }
         case "$choice" in
             1)  docker_full_scan ;;
             2)  docker_run_scan docker_scan_services "Service Health (s6)" ;;
@@ -5468,6 +5711,8 @@ docker_main_menu() {
             13) docker_menu_syslog_test ;;
             14) docker_menu_syslog_stream ;;
             15) docker_menu_wef ;;
+            16) docker_menu_hec_test ;;
+            17) docker_menu_hec_stream ;;
             0)  echo ""; log_info "Goodbye."; exit 0 ;;
             *)  ;;
         esac

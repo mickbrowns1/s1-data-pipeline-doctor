@@ -111,6 +111,8 @@ A Docker site is a single container (image `observo-standalone-site`) that runs 
 | 13 | **Syslog tester** | Send a synthetic syslog event (Firewall, Auth, DNS, Web, or Generic) to a published source port on `localhost`. Embeds a unique UUID so you can locate the event in SDL with `message contains '<uuid>'` |
 | 14 | **Syslog stream (continuous)** | Same event types as the tester, sent on a loop at a configurable interval — useful for soak-testing a source or watching data flow live in SDL |
 | 15 | **WEF/WEC integration** | Read-only readiness check (source found, port published, checkpoint store, cert readability, FIPS mode, last error, forwarders seen), a one-recreate "make this site WEF-ready" fix, Windows forwarder setup (prints/writes a ready-to-run PowerShell script), a TLS endpoint test, and forwarder activity. Shows a live issue count in the menu when WEF mode is on (see below) |
+| 16 | **HEC tester** | Send a single test event to a published Splunk HEC-push source's `/services/collector/event` endpoint, reading its address, TLS setting, and token straight from the dataplane config. Only works if a HEC-push source is actually configured |
+| 17 | **HEC stream (continuous)** | Same as the HEC tester, sent on a loop at a configurable interval |
 | 0 | **Exit** | |
 
 ### Opening source ports

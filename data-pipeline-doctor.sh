@@ -5366,22 +5366,98 @@ _dp_pick_hec_source() {
     return 0
 }
 
-# Pick a syslog-capable published port for the current container.
-# Sets DP_SYSLOG_PORT and DP_SYSLOG_PROTO on success; returns 1 on cancel / none found.
-# Auto-selects when only one candidate, otherwise offers a menu.
+# Block-scoped read of every `type: socket` source under `sources:` in the
+# container's own resolved /etc/dataplane/config.yaml — the raw TCP/UDP
+# listener type the console uses for Syslog (and CEF/LEEF, which rides the
+# same transport). Same approach as _dp_hec_read_config / _dp_wef_read_config.
+# Sets parallel arrays, one entry per socket source found: DP_SYSLOG_KEYS
+# (source key), DP_SYSLOG_ADDR (container-side "host:port"), DP_SYSLOG_MODE
+# (its mode: tcp|udp, "tcp" if unspecified).
+_dp_syslog_read_config() {
+    DP_SYSLOG_KEYS=()
+    DP_SYSLOG_ADDR=()
+    DP_SYSLOG_MODE=()
+
+    local cfg
+    cfg=$(dexec sh -c "cat /etc/dataplane/config.yaml /etc/collector/config.yaml 2>/dev/null" 2>/dev/null)
+    [[ -z "$cfg" ]] && return 1
+
+    local parsed
+    parsed=$(echo "$cfg" | awk '
+        function flush() {
+            if (issock) print "SOCK_KEY=" key "\nSOCK_ADDR=" addr "\nSOCK_MODE=" mode "\nSOCK_END=1"
+            issock=0; key=""; addr=""; mode="tcp"
+        }
+        /^sources:/ { insrc=1; next }
+        /^[^ ]/ { if (insrc) flush(); insrc=0 }
+        insrc && /^  [^ ]/ {
+            flush()
+            k=$0; sub(/^  /,"",k); sub(/:[ ]*$/,"",k); gsub(/"/,"",k); key=k
+            next
+        }
+        insrc && /^    type:[ ]*socket[ ]*$/ { issock=1 }
+        insrc && /^    address:/ { sub(/^    address:[ ]*/,""); addr=$0 }
+        insrc && /^    mode:/ { sub(/^    mode:[ ]*/,""); mode=$0 }
+        END { if (insrc) flush() }
+    ')
+    [[ -z "$parsed" ]] && return 1
+
+    local line key="" addr="" mode="tcp"
+    while IFS= read -r line; do
+        case "$line" in
+            SOCK_KEY=*)  key="${line#SOCK_KEY=}" ;;
+            SOCK_ADDR=*) addr="${line#SOCK_ADDR=}" ;;
+            SOCK_MODE=*) mode="${line#SOCK_MODE=}" ;;
+            SOCK_END=*)
+                DP_SYSLOG_KEYS+=("$key"); DP_SYSLOG_ADDR+=("$addr"); DP_SYSLOG_MODE+=("$mode")
+                key=""; addr=""; mode="tcp"
+                ;;
+        esac
+    done <<< "$parsed"
+
+    [[ ${#DP_SYSLOG_KEYS[@]} -gt 0 ]]
+}
+
+# Pick a published, syslog-source-backed port for the current container.
+# Sets DP_SYSLOG_PORT and DP_SYSLOG_PROTO on success; returns 1 on cancel /
+# none found. Auto-selects when only one candidate, otherwise offers a menu.
+#
+# Gated on _dp_syslog_read_config finding at least one real socket source —
+# no bare "(custom)" fallback for an arbitrary published port anymore.
+# Matching a config source's address: port to the container port a host
+# port is actually published on isn't a plain equality check: a privileged
+# port the console lets you choose (e.g. 514/udp) gets remapped to an
+# unprivileged one inside the container (confirmed live: address: 0.0.0.0:514
+# in config, but the container is actually bound to 10514/udp, published to
+# host port 514 — 2026-11-02). _dp_port_role already encodes that exact,
+# previously-confirmed 514<->10514(UDP)/514<->1514(TCP) shape, so a published
+# port matches if either _dp_port_role recognizes its container port as
+# Syslog*, or its container port number literally equals a configured
+# source's address port (covers any non-privileged, non-remapped port).
 _dp_pick_syslog_port() {
-    # Collect syslog-capable published ports (skip HEC push and Kafka which have dedicated ports).
-    local entries=() hports=() protos=() hip hport cport role label
+    _dp_syslog_read_config
+    if [[ ${#DP_SYSLOG_KEYS[@]} -eq 0 ]]; then
+        log_warn "No Syslog/CEF/LEEF source found in this site's pipeline."
+        echo -e "  ${DIM}Add a Syslog (or CEF/LEEF) source in the console first.${NC}"
+        pause; return 1
+    fi
+
+    local entries=() hports=() protos=() hip hport cport role label i cfgport mode match
     while IFS='|' read -r hip hport cport; do
         [[ -z "$cport" ]] && continue
         role="$(_dp_port_role "$cport" "$hport")"
-        case "$role" in
-            "HEC push"|"Kafka") continue ;;
-        esac
         if [[ "$role" == Syslog* ]]; then
             label="host ${hport} → container ${cport}  (${role})"
         else
-            label="host ${hport} → container ${cport}  (custom)"
+            match=false
+            for i in "${!DP_SYSLOG_KEYS[@]}"; do
+                cfgport="${DP_SYSLOG_ADDR[$i]##*:}"
+                if [[ "$cfgport" == "${cport%%/*}" ]]; then
+                    match=true; mode="${DP_SYSLOG_MODE[$i]}"; break
+                fi
+            done
+            $match || continue
+            label="host ${hport} → container ${cport}  (Syslog ${mode^^})"
         fi
         entries+=("$label")
         hports+=("$hport")
@@ -5389,8 +5465,8 @@ _dp_pick_syslog_port() {
     done < <(dinspect '{{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostIp}}|{{.HostPort}}|{{$p}}{{println}}{{end}}{{end}}')
 
     if [[ ${#entries[@]} -eq 0 ]]; then
-        log_warn "No syslog-capable published ports found."
-        echo -e "  ${DIM}Use option 12 — Source ports to publish one first.${NC}"
+        log_warn "Found a Syslog/CEF/LEEF source in the config, but its container port isn't published on the host."
+        echo -e "  ${DIM}Use option 12 — Source ports to publish it first.${NC}"
         pause; return 1
     fi
 

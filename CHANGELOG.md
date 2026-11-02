@@ -10,6 +10,20 @@ version string yet.
 
 ### Changed
 
+- Syslog tester and Syslog stream (options 13-14) now gate on an actual
+  Syslog/CEF/LEEF source existing in the dataplane config, the same way
+  the new HEC tester gates on a HEC source — previously any published port
+  that didn't look like a known HEC/Kafka port was offered as a "(custom)"
+  syslog target even with no syslog-type source configured on it at all.
+  Reading `/etc/dataplane/config.yaml` surfaced a port-remap quirk: a
+  privileged port the console lets you choose (e.g. `514/udp`) is actually
+  bound inside the container on an unprivileged one (`10514/udp`) — already
+  handled by `_dp_port_role`'s existing 514/10514 and 514/1514 pairings, so
+  matching now accepts either that recognized shape or a literal port-number
+  match against the source's own configured address. Verified against a
+  live Syslog UDP source (`514` → `10514` remap) and a HEC-only site (now
+  correctly refuses instead of offering a HEC port as a syslog target).
+  (2026-11-02)
 - New Site Setup now offers to paste the `.env` contents in directly as
   the default option (Enter = yes) instead of defaulting to waiting on a
   file copy. Copying the file to `~/ai-data-pipelines.env` beforehand still

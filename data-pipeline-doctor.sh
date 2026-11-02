@@ -2440,7 +2440,7 @@ docker_setup_new_site() {
             _dp_env_set_openssl_conf "$env_file" "/etc/ssl/openssl.cnf.default"
             log_ok "Set OPENSSL_CONF=/etc/ssl/openssl.cnf.default in $env_file"
         else
-            log_warn "FIPS left on — the WEF source will fail to start until it's turned off (Tools 15 → 2)."
+            log_warn "FIPS left on — the WEF source will fail to start until it's turned off (Tools 17 → 2)."
         fi
         echo
     fi
@@ -2659,7 +2659,7 @@ _dpd_ask_wef_mode() {
     echo "    Answer yes if Windows hosts will forward their event logs to this site."
     echo "    Doctor then sets the site up for it (port, certificate folder, checkpoint"
     echo "    store, FIPS) and checks it on every run."
-    echo -e "  ${DIM}Not sure? Answer no — you can add WEF any time later from Tools 15 →${NC}"
+    echo -e "  ${DIM}Not sure? Answer no — you can add WEF any time later from Tools 17 →${NC}"
     echo -e "  ${DIM}Make this site WEF-ready, without reinstalling.${NC}"
     echo ""
     local ans
@@ -2673,14 +2673,14 @@ _dpd_ask_wef_mode() {
     if $WEF_MODE; then
         log_ok "WEF/WEC mode on — this site will be checked for WEF readiness once its container is found."
     else
-        log_info "WEF/WEC mode off — Tools 15 is still available if you need it later."
+        log_info "WEF/WEC mode off — Tools 17 is still available if you need it later."
     fi
     echo -e "  ${DIM}Saved to ${pf} (edit or delete it to change the answer).${NC}"
 }
 
 # Runs right after docker_preflight when WEF/WEC mode is on, so a "yes" at
 # startup leads straight to the fix instead of waiting to be found under
-# Tools 15. Read-only unless the user accepts the Make-ready offer.
+# Tools 17. Read-only unless the user accepts the Make-ready offer.
 _dpd_wef_startup_check() {
     $WEF_MODE || return 0
     # Just built WEF-ready by docker_setup_new_site, which already printed the
@@ -2691,7 +2691,7 @@ _dpd_wef_startup_check() {
     echo ""
     if ! $DP_WEF_FOUND; then
         log_info "WEF/WEC: no Windows Event Forwarding source in this site's pipeline yet."
-        echo -e "  ${DIM}Add one in the console, then use Tools 15 → Make this site WEF-ready.${NC}"
+        echo -e "  ${DIM}Add one in the console, then use Tools 17 → Make this site WEF-ready.${NC}"
         pause
         return 0
     fi
@@ -2705,7 +2705,7 @@ _dpd_wef_startup_check() {
     if confirm_yes "This site isn't WEF-ready yet. Make it WEF-ready now?"; then
         docker_wef_make_ready
     else
-        log_info "Skipped — run it later from Tools 15 → 2."
+        log_info "Skipped — run it later from Tools 17 → 2."
         pause
     fi
 }
@@ -4645,7 +4645,7 @@ _dp_wef_print_next_steps() {
     if [[ ${#missing[@]} -gt 0 ]]; then
         echo "    1. Copy the server certificate, key, and CA into ${cert_dir}:"
         echo "         ${missing[*]}"
-        echo "       Then re-run Doctor (or Tools 15 → 2) to set ownership for the container."
+        echo "       Then re-run Doctor (or Tools 17 → 2) to set ownership for the container."
     else
         echo "    1. Certificates found in ${cert_dir} — ownership set for the container."
     fi
@@ -4655,7 +4655,7 @@ _dp_wef_print_next_steps() {
     echo "         CA / cert / key:    ${cert_dir}/ca.crt, ${cert_dir}/server.crt, ${cert_dir}/server.key"
     echo "    3. Point the Windows subscription manager at:"
     echo "         Server=https://${fqdn}:${port}/wsman/SubscriptionManager/WEC,Refresh=60,IssuerCA=<CA thumbprint>"
-    echo "    4. Check it with Tools 15 → 1 (readiness check) once the source is deployed."
+    echo "    4. Check it with Tools 17 → 1 (readiness check) once the source is deployed."
     echo ""
 }
 
@@ -4939,7 +4939,7 @@ docker_wef_forwarder_setup() {
 
     echo -e "  ${BOLD}Values for this site${NC}"
     echo "    Collector address:   ${host}:${port}"
-    echo "    CA thumbprint:       ${thumb:-(could not read — check the CA file is readable, Tools 15 → 1)}"
+    echo "    CA thumbprint:       ${thumb:-(could not read — check the CA file is readable, Tools 17 → 1)}"
     echo "    Subscription manager:"
     echo -e "      ${CYAN}${sub}${NC}"
     echo ""
@@ -5052,7 +5052,7 @@ docker_wef_tls_test() {
         log_err "Could not identify the CA, certificate and key paths from the source config"
         ((problems++))
     elif ! dexec test -r "$DP_WEF_CRT" 2>/dev/null; then
-        log_err "Certificate files aren't readable inside the container — run Tools 15 → 2 first"
+        log_err "Certificate files aren't readable inside the container — run Tools 17 → 2 first"
         ((problems++))
     else
         local subj san end
@@ -5102,7 +5102,7 @@ docker_wef_tls_test() {
     if [[ "$hs" == *"Verify return code: 0 (ok)"* ]]; then
         log_ok "TLS handshake on container port ${cport} succeeded ($(echo "$hs" | grep -m1 -oE 'TLSv1\.[0-3]'), verified against the CA)"
     elif [[ -z "$hs" || "$hs" == *"Connection refused"* || "$hs" == *"errno=111"* ]]; then
-        log_err "Nothing is listening on container port ${cport} — the WEF source isn't running (check Tools 15 → 1 for the last error)"
+        log_err "Nothing is listening on container port ${cport} — the WEF source isn't running (check Tools 17 → 1 for the last error)"
         ((problems++))
     else
         log_err "TLS handshake on container port ${cport} failed: $(echo "$hs" | grep -m1 -E 'Verify return code|error|errno' | cut -c1-120)"
@@ -5131,7 +5131,7 @@ docker_wef_tls_test() {
 
     echo ""
     if [[ $problems -eq 0 ]]; then
-        log_ok "TLS endpoint looks good. If forwarders still don't connect, check their side (Tools 15 → 3)."
+        log_ok "TLS endpoint looks good. If forwarders still don't connect, check their side (Tools 17 → 3)."
     else
         log_err "${problems} problem(s) found."
     fi
@@ -5757,13 +5757,13 @@ docker_main_menu() {
         printf "    ${CYAN}%2s)${NC} %-30s ${CYAN}%2s)${NC} %s\n" 9 "Restart service/container" 10 "Tail sources & destinations"
         printf "    ${CYAN}%2s)${NC} %-30s ${CYAN}%2s)${NC} %s\n" 11 "Proxy & connectivity" 12 "Source ports"
         printf "    ${CYAN}%2s)${NC} %-30s ${CYAN}%2s)${NC} %s\n" 13 "Syslog tester" 14 "Syslog stream (continuous)"
+        printf "    ${CYAN}%2s)${NC} %-30s ${CYAN}%2s)${NC} %s\n" 15 "HEC tester" 16 "HEC stream (continuous)"
         local wef_label="WEF/WEC integration"
         if $WEF_MODE; then
             _dp_wef_check
             [[ $DP_WEF_ISSUES -gt 0 ]] && wef_label="WEF/WEC integration (${DP_WEF_ISSUES} issue$([[ $DP_WEF_ISSUES -eq 1 ]] || echo s))"
         fi
-        printf "    ${CYAN}%2s)${NC} %s\n" 15 "$wef_label"
-        printf "    ${CYAN}%2s)${NC} %-30s ${CYAN}%2s)${NC} %s\n" 16 "HEC tester" 17 "HEC stream (continuous)"
+        printf "    ${CYAN}%2s)${NC} %s\n" 17 "$wef_label"
         echo ""
         hr
         echo ""
@@ -5786,9 +5786,9 @@ docker_main_menu() {
             12) docker_menu_source_ports ;;
             13) docker_menu_syslog_test ;;
             14) docker_menu_syslog_stream ;;
-            15) docker_menu_wef ;;
-            16) docker_menu_hec_test ;;
-            17) docker_menu_hec_stream ;;
+            15) docker_menu_hec_test ;;
+            16) docker_menu_hec_stream ;;
+            17) docker_menu_wef ;;
             0)  echo ""; log_info "Goodbye."; exit 0 ;;
             *)  ;;
         esac

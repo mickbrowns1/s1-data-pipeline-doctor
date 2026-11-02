@@ -31,7 +31,7 @@ version string yet.
 
 ### Added
 
-- HEC tester (Tools 16) and HEC stream (Tools 17), mirroring the Syslog
+- HEC tester (Tools 15) and HEC stream (Tools 16), mirroring the Syslog
   tester/stream pair (options 13–14) but for Splunk HEC-push sources: send
   a real `POST /services/collector/event` to a published HEC port, either
   once or on a loop, reading the source's address, TLS flag, and token
@@ -45,7 +45,7 @@ version string yet.
   header but is never printed. Verified against a live site with two HEC
   sources: both sent (HTTP 200), and a deliberately wrong token was
   rejected (HTTP 401). (2026-11-02)
-- WEF/WEC menu (Tools 15), options 3–5 (2026-10-30):
+- WEF/WEC menu (Tools 17), options 3–5 (2026-10-30):
   - **Windows forwarder setup.** Shows the site's collector address, CA
     thumbprint and subscription manager string, plus the steps for each
     Windows forwarder. It can write `wef-forwarder-setup.ps1`, which is
@@ -71,7 +71,7 @@ version string yet.
 - WEF/WEC integration: a startup question (Docker sites only) asking
   whether this host manages WEF/WEC-forwarding sites, remembered in
   `~/.data-pipeline-doctor/profile`. When on, the Full diagnostic scan adds
-  a read-only WEF readiness section, and a new Docker menu option 15 offers
+  a read-only WEF readiness section, and a new Docker menu option 17 offers
   a read-only readiness check (source found, port published, checkpoint
   store, cert readability, FIPS mode, last error, forwarders seen) plus
   "Make this site WEF-ready" — applies the checkpoint store, cert mount,
@@ -107,7 +107,7 @@ version string yet.
   checkpoint store, and offers to turn FIPS off in the env file (with a
   warning, default No). It finishes with next steps: certs still to copy,
   the console source's listen address, callback and cert paths, the
-  Windows subscription manager string, and Tools 15 → 1 to verify.
+  Windows subscription manager string, and Tools 17 → 1 to verify.
   Right after this setup, the startup readiness check is skipped, because
   the console hasn't pushed the pipeline yet. (2026-10-30)
 

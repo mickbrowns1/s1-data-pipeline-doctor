@@ -87,21 +87,24 @@ _dp_gen_uuid() {
     fi
 }
 
-# Build an RFC3164 syslog line for a category, with uuid embedded in the message body.
-# $1 = category key (fw|auth|dns|web|generic)   $2 = uuid
+# Build an RFC3164 syslog line for a category, with uuid and pipeline label
+# embedded in the message body.
+# $1 = category key (fw|auth|dns|web|generic)   $2 = uuid   $3 = pipeline label (optional)
 # IPs use TEST-NET (RFC 5737) so events are obviously synthetic.
 # Returns "num_pri|logger_pri_name|tag|body" for a syslog test event.
 # Keeping the PRI numeric and name separate lets the logger path use native flags
 # (no double-encoding) while the nc path builds its own RFC3164 header.
 # IPs use TEST-NET (RFC 5737) so events are obviously synthetic.
 _dp_syslog_event() {
-    local cat="$1" uuid="$2"
+    local cat="$1" uuid="$2" pipeline="${3:-}" suffix
+    suffix="test-id=${uuid}"
+    [[ -n "$pipeline" ]] && suffix="pipeline=${pipeline} ${suffix}"
     case "$cat" in
-        fw)   printf '134|local0.info|firewall|action=DENY proto=TCP src=203.0.113.10 dst=198.51.100.5 dpt=443 test-id=%s' "$uuid" ;;
-        auth) printf '38|auth.info|sshd[4242]|Failed password for invalid user admin from 203.0.113.10 port 52311 ssh2 test-id=%s' "$uuid" ;;
-        dns)  printf '142|local1.info|named[990]|query: example.test IN A from 203.0.113.10 test-id=%s' "$uuid" ;;
-        web)  printf '134|local0.info|nginx|203.0.113.10 - - "GET /healthz HTTP/1.1" 200 12 test-id=%s' "$uuid" ;;
-        *)    printf '134|local0.info|dpd-syslog-test|synthetic test event test-id=%s' "$uuid" ;;
+        fw)   printf '134|local0.info|firewall|action=DENY proto=TCP src=203.0.113.10 dst=198.51.100.5 dpt=443 %s' "$suffix" ;;
+        auth) printf '38|auth.info|sshd[4242]|Failed password for invalid user admin from 203.0.113.10 port 52311 ssh2 %s' "$suffix" ;;
+        dns)  printf '142|local1.info|named[990]|query: example.test IN A from 203.0.113.10 %s' "$suffix" ;;
+        web)  printf '134|local0.info|nginx|203.0.113.10 - - "GET /healthz HTTP/1.1" 200 12 %s' "$suffix" ;;
+        *)    printf '134|local0.info|dpd-syslog-test|synthetic test event %s' "$suffix" ;;
     esac
 }
 
@@ -3857,6 +3860,20 @@ docker_load_component_names() {
     [[ ${#PIPELINE_NAME_MAP[@]} -gt 0 ]] && log_info "Loaded ${#PIPELINE_NAME_MAP[@]} component name(s) from $f"
 }
 
+# Human-readable label for a source key (e.g. "100000000000003417_source"),
+# for embedding in test events so a multi-source site's events are
+# identifiable at a glance. Loads PIPELINE_NAME_MAP on first use (cheap: a
+# no-op if the optional names file doesn't exist). Falls back to the bare
+# entity id if no name is mapped, and strips quotes/backslashes so the
+# result is always safe to embed in either a JSON string or a syslog line.
+_dp_pipeline_label_for_key() {
+    local key="$1" eid label
+    [[ ${#PIPELINE_NAME_MAP[@]} -eq 0 ]] && docker_load_component_names
+    eid="${key%%_*}"
+    label="$(_name_for_entity "$eid")" || label="$eid"
+    printf '%s' "$label" | tr -d '"\\'
+}
+
 # Map a raw connector type to a human label (per the GA connector vocabulary).
 # Unknown/internal types pass through unchanged.
 _friendly_type() {
@@ -5321,7 +5338,7 @@ _dp_pick_hec_source() {
         pause; return 1
     fi
 
-    local entries=() hports=() tokens=() tlsflags=()
+    local entries=() hports=() tokens=() tlsflags=() keys=()
     local i cport hip hport cport2 matched_hport tls_tag
     for i in "${!DP_HEC_KEYS[@]}"; do
         cport="${DP_HEC_ADDR[$i]##*:}"
@@ -5339,6 +5356,7 @@ _dp_pick_hec_source() {
         hports+=("$matched_hport")
         tokens+=("${DP_HEC_TOKEN[$i]}")
         tlsflags+=("${DP_HEC_TLS[$i]}")
+        keys+=("${DP_HEC_KEYS[$i]}")
     done
 
     if [[ ${#entries[@]} -eq 0 ]]; then
@@ -5349,6 +5367,7 @@ _dp_pick_hec_source() {
 
     if [[ ${#entries[@]} -eq 1 ]]; then
         DP_HEC_PORT="${hports[0]}"; DP_HEC_TOKEN_SEL="${tokens[0]}"; DP_HEC_TLS_SEL="${tlsflags[0]}"
+        DP_HEC_KEY_SEL="${keys[0]}"
         log_info "Using the only available HEC source: host ${DP_HEC_PORT}"
         echo ""
         return 0
@@ -5363,6 +5382,7 @@ _dp_pick_hec_source() {
     DP_HEC_PORT="${hports[$(( src_choice - 1 ))]}"
     DP_HEC_TOKEN_SEL="${tokens[$(( src_choice - 1 ))]}"
     DP_HEC_TLS_SEL="${tlsflags[$(( src_choice - 1 ))]}"
+    DP_HEC_KEY_SEL="${keys[$(( src_choice - 1 ))]}"
     return 0
 }
 
@@ -5442,26 +5462,39 @@ _dp_pick_syslog_port() {
         pause; return 1
     fi
 
-    local entries=() hports=() protos=() hip hport cport role label i cfgport mode match
+    local entries=() hports=() protos=() keys=() hip hport cport role label
+    local i cfgport mode match rawport altport
     while IFS='|' read -r hip hport cport; do
         [[ -z "$cport" ]] && continue
         role="$(_dp_port_role "$cport" "$hport")"
+        rawport="${cport%%/*}"
+        # Same privileged-port remap _dp_port_role already encodes (514<->10514
+        # UDP, 514<->1514 TCP) — checked here too so the matched source's own
+        # key (and its pipeline name) can still be found in the remap case.
+        altport="$rawport"
+        case "$rawport" in
+            10514) altport=514 ;;
+            1514)  altport=514 ;;
+        esac
+
+        match=false
+        for i in "${!DP_SYSLOG_KEYS[@]}"; do
+            cfgport="${DP_SYSLOG_ADDR[$i]##*:}"
+            if [[ "$cfgport" == "$rawport" || "$cfgport" == "$altport" ]]; then
+                match=true; mode="${DP_SYSLOG_MODE[$i]}"; break
+            fi
+        done
+
         if [[ "$role" == Syslog* ]]; then
             label="host ${hport} → container ${cport}  (${role})"
         else
-            match=false
-            for i in "${!DP_SYSLOG_KEYS[@]}"; do
-                cfgport="${DP_SYSLOG_ADDR[$i]##*:}"
-                if [[ "$cfgport" == "${cport%%/*}" ]]; then
-                    match=true; mode="${DP_SYSLOG_MODE[$i]}"; break
-                fi
-            done
             $match || continue
             label="host ${hport} → container ${cport}  (Syslog ${mode^^})"
         fi
         entries+=("$label")
         hports+=("$hport")
         protos+=("${cport##*/}")
+        keys+=("$($match && echo "${DP_SYSLOG_KEYS[$i]}")")
     done < <(dinspect '{{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostIp}}|{{.HostPort}}|{{$p}}{{println}}{{end}}{{end}}')
 
     if [[ ${#entries[@]} -eq 0 ]]; then
@@ -5471,7 +5504,7 @@ _dp_pick_syslog_port() {
     fi
 
     if [[ ${#entries[@]} -eq 1 ]]; then
-        DP_SYSLOG_PORT="${hports[0]}"; DP_SYSLOG_PROTO="${protos[0]}"
+        DP_SYSLOG_PORT="${hports[0]}"; DP_SYSLOG_PROTO="${protos[0]}"; DP_SYSLOG_KEY_SEL="${keys[0]}"
         log_info "Using the only available port: host ${DP_SYSLOG_PORT} (${DP_SYSLOG_PROTO})"
         echo ""
         return 0
@@ -5485,6 +5518,7 @@ _dp_pick_syslog_port() {
     fi
     DP_SYSLOG_PORT="${hports[$(( port_choice - 1 ))]}"
     DP_SYSLOG_PROTO="${protos[$(( port_choice - 1 ))]}"
+    DP_SYSLOG_KEY_SEL="${keys[$(( port_choice - 1 ))]}"
     return 0
 }
 
@@ -5495,6 +5529,7 @@ docker_menu_syslog_test() {
 
     _dp_pick_syslog_port || return
     local port="$DP_SYSLOG_PORT" proto="$DP_SYSLOG_PROTO"
+    local pipeline; pipeline="$(_dp_pipeline_label_for_key "$DP_SYSLOG_KEY_SEL"):${port}"
 
     # Pick event category.
     local cat_choice cat
@@ -5517,11 +5552,11 @@ docker_menu_syslog_test() {
     # Generate UUID, build and send the event.
     local UUID event body_preview
     UUID="$(_dp_gen_uuid)"
-    event="$(_dp_syslog_event "$cat" "$UUID")"
+    event="$(_dp_syslog_event "$cat" "$UUID" "$pipeline")"
     body_preview="${event##*|}"
 
     echo ""
-    log_info "Sending to localhost:${port}/${proto}"
+    log_info "Sending to localhost:${port}/${proto} (pipeline: ${pipeline})"
     echo -e "  ${DIM}${body_preview}${NC}"
     echo ""
 
@@ -5548,6 +5583,7 @@ docker_menu_syslog_stream() {
 
     _dp_pick_syslog_port || return
     local port="$DP_SYSLOG_PORT" proto="$DP_SYSLOG_PROTO"
+    local pipeline; pipeline="$(_dp_pipeline_label_for_key "$DP_SYSLOG_KEY_SEL"):${port}"
 
     # Pick event category.
     local cat_choice cat
@@ -5582,7 +5618,7 @@ docker_menu_syslog_stream() {
     UUID="$(_dp_gen_uuid)"
 
     echo ""
-    log_info "Streaming ${cat} events to localhost:${port}/${proto} every ${rate}s."
+    log_info "Streaming ${cat} events to localhost:${port}/${proto} every ${rate}s (pipeline: ${pipeline})."
     echo -e "  ${DIM}Open a log preview / Tail (option 10) in the Observo UI now — press Ctrl-C to stop.${NC}"
     echo -e "  ${DIM}Find this batch in SDL Event ALL Search: message contains '${UUID}'${NC}"
     echo ""
@@ -5592,7 +5628,7 @@ docker_menu_syslog_stream() {
     local sent=0 fails=0 stop=0 event
     trap 'stop=1' INT
     while [[ "$stop" -eq 0 ]]; do
-        event="$(_dp_syslog_event "$cat" "$UUID")"
+        event="$(_dp_syslog_event "$cat" "$UUID" "$pipeline")"
         if _dp_send_syslog "$event" "$port" "$proto" >/dev/null 2>&1; then
             sent=$(( sent + 1 ))
         else
@@ -5618,27 +5654,30 @@ docker_menu_syslog_stream() {
     pause
 }
 
-# Build a Splunk HEC /services/collector/event JSON body with uuid embedded
-# in the event text, so the test event is findable the same way the syslog
-# tester's events are: 'message contains <uuid>' in SDL Event ALL Search.
+# Build a Splunk HEC /services/collector/event JSON body with uuid (and,
+# when known, the pipeline name) embedded in the event text, so the test
+# event is findable the same way the syslog tester's events are: 'message
+# contains <uuid>' in SDL Event ALL Search.
 _dp_hec_event_body() {
-    local uuid="$1"
-    printf '{"event":"dpd HEC test event test-id=%s","sourcetype":"dpd:test"}' "$uuid"
+    local uuid="$1" pipeline="${2:-}" suffix
+    suffix="test-id=${uuid}"
+    [[ -n "$pipeline" ]] && suffix="pipeline=${pipeline} ${suffix}"
+    printf '{"event":"dpd HEC test event %s","sourcetype":"dpd:test"}' "$suffix"
 }
 
-# Send one HEC test event. $1 = uuid  $2 = port  $3 = token  $4 = tls (true|false)
+# Send one HEC test event. $1 = uuid  $2 = port  $3 = token  $4 = tls (true|false)  $5 = pipeline label (optional)
 # Never echoes the token — it goes straight into the curl arg vector, never
 # printed. -k accepts a self-signed cert; this is a connectivity/auth probe,
 # not a certificate validator (TLS & certificates, option 4, covers that).
 _dp_send_hec() {
-    local uuid="$1" port="$2" token="$3" tls="$4" scheme="http"
+    local uuid="$1" port="$2" token="$3" tls="$4" pipeline="${5:-}" scheme="http"
     [[ "$tls" == "true" ]] && scheme="https"
     local code
     code=$(curl -s -o /dev/null -w '%{http_code}' -k --connect-timeout 5 --max-time 10 \
         -X POST "${scheme}://localhost:${port}/services/collector/event" \
         -H "Authorization: Splunk ${token}" \
         -H "Content-Type: application/json" \
-        -d "$(_dp_hec_event_body "$uuid")" 2>/dev/null || echo "000")
+        -d "$(_dp_hec_event_body "$uuid" "$pipeline")" 2>/dev/null || echo "000")
     echo "$code"
 }
 
@@ -5649,16 +5688,17 @@ docker_menu_hec_test() {
 
     _dp_pick_hec_source || return
     local port="$DP_HEC_PORT" token="$DP_HEC_TOKEN_SEL" tls="$DP_HEC_TLS_SEL"
+    local pipeline; pipeline="$(_dp_pipeline_label_for_key "$DP_HEC_KEY_SEL"):${port}"
     local scheme="http"; [[ "$tls" == "true" ]] && scheme="https"
 
     local UUID code
     UUID="$(_dp_gen_uuid)"
 
     echo ""
-    log_info "Sending to ${scheme}://localhost:${port}/services/collector/event"
+    log_info "Sending to ${scheme}://localhost:${port}/services/collector/event (pipeline: ${pipeline})"
     echo ""
 
-    code="$(_dp_send_hec "$UUID" "$port" "$token" "$tls")"
+    code="$(_dp_send_hec "$UUID" "$port" "$token" "$tls" "$pipeline")"
     case "$code" in
         2*)
             log_ok "HEC accepted the event (HTTP ${code})."
@@ -5690,6 +5730,7 @@ docker_menu_hec_stream() {
 
     _dp_pick_hec_source || return
     local port="$DP_HEC_PORT" token="$DP_HEC_TOKEN_SEL" tls="$DP_HEC_TLS_SEL"
+    local pipeline; pipeline="$(_dp_pipeline_label_for_key "$DP_HEC_KEY_SEL"):${port}"
     local scheme="http"; [[ "$tls" == "true" ]] && scheme="https"
 
     local rate
@@ -5704,7 +5745,7 @@ docker_menu_hec_stream() {
     UUID="$(_dp_gen_uuid)"
 
     echo ""
-    log_info "Streaming HEC events to ${scheme}://localhost:${port}/services/collector/event every ${rate}s."
+    log_info "Streaming HEC events to ${scheme}://localhost:${port}/services/collector/event every ${rate}s (pipeline: ${pipeline})."
     echo -e "  ${DIM}Open a log preview / Tail (option 10) in the Observo UI now — press Ctrl-C to stop.${NC}"
     echo -e "  ${DIM}Find this batch in SDL Event ALL Search: message contains '${UUID}'${NC}"
     echo ""
@@ -5712,7 +5753,7 @@ docker_menu_hec_stream() {
     local sent=0 fails=0 stop=0 code
     trap 'stop=1' INT
     while [[ "$stop" -eq 0 ]]; do
-        code="$(_dp_send_hec "$UUID" "$port" "$token" "$tls")"
+        code="$(_dp_send_hec "$UUID" "$port" "$token" "$tls" "$pipeline")"
         if [[ "$code" =~ ^2 ]]; then
             sent=$(( sent + 1 ))
         else

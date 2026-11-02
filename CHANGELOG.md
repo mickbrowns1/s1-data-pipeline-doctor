@@ -10,6 +10,13 @@ version string yet.
 
 ### Changed
 
+- Syslog and HEC tester/stream events now include the pipeline they were
+  sent to (`pipeline=<id>:<port>` in the event body, e.g.
+  `pipeline=100000000000004413:8001`) — useful once a site has more than
+  one Syslog or HEC source. The id is the dataplane's own entity id (the
+  console's own component name isn't in the dataplane config, only on the
+  control-plane side, so it isn't available here); the port makes each
+  pipeline distinct without needing the optional names file. (2026-11-02)
 - Syslog tester and Syslog stream (options 13-14) now gate on an actual
   Syslog/CEF/LEEF source existing in the dataplane config, the same way
   the new HEC tester gates on a HEC source — previously any published port

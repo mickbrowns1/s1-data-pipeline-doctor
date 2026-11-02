@@ -10,6 +10,27 @@ version string yet.
 
 ### Changed
 
+- Syslog and HEC tester/stream events now include the pipeline they were
+  sent to (`pipeline=<id>:<port>` in the event body, e.g.
+  `pipeline=100000000000004413:8001`) — useful once a site has more than
+  one Syslog or HEC source. The id is the dataplane's own entity id (the
+  console's own component name isn't in the dataplane config, only on the
+  control-plane side, so it isn't available here); the port makes each
+  pipeline distinct without needing the optional names file. (2026-11-02)
+- Syslog tester and Syslog stream (options 13-14) now gate on an actual
+  Syslog/CEF/LEEF source existing in the dataplane config, the same way
+  the new HEC tester gates on a HEC source — previously any published port
+  that didn't look like a known HEC/Kafka port was offered as a "(custom)"
+  syslog target even with no syslog-type source configured on it at all.
+  Reading `/etc/dataplane/config.yaml` surfaced a port-remap quirk: a
+  privileged port the console lets you choose (e.g. `514/udp`) is actually
+  bound inside the container on an unprivileged one (`10514/udp`) — already
+  handled by `_dp_port_role`'s existing 514/10514 and 514/1514 pairings, so
+  matching now accepts either that recognized shape or a literal port-number
+  match against the source's own configured address. Verified against a
+  live Syslog UDP source (`514` → `10514` remap) and a HEC-only site (now
+  correctly refuses instead of offering a HEC port as a syslog target).
+  (2026-11-02)
 - New Site Setup now offers to paste the `.env` contents in directly as
   the default option (Enter = yes) instead of defaulting to waiting on a
   file copy. Copying the file to `~/ai-data-pipelines.env` beforehand still
@@ -17,7 +38,21 @@ version string yet.
 
 ### Added
 
-- WEF/WEC menu (Tools 15), options 3–5 (2026-10-30):
+- HEC tester (Tools 15) and HEC stream (Tools 16), mirroring the Syslog
+  tester/stream pair (options 13–14) but for Splunk HEC-push sources: send
+  a real `POST /services/collector/event` to a published HEC port, either
+  once or on a loop, reading the source's address, TLS flag, and token
+  straight from `/etc/dataplane/config.yaml` the same read-only way
+  `_dp_wef_read_config` does for WEF. Both only find a source if one is
+  actually configured — with none, they say so and point at adding a HEC
+  source in the console, same as the Syslog tester does when no
+  syslog-capable port is published. When more than one HEC source is
+  configured, offers a picker; when exactly one is found and published,
+  auto-selects it. The token is read to build the request's `Authorization`
+  header but is never printed. Verified against a live site with two HEC
+  sources: both sent (HTTP 200), and a deliberately wrong token was
+  rejected (HTTP 401). (2026-11-02)
+- WEF/WEC menu (Tools 17), options 3–5 (2026-10-30):
   - **Windows forwarder setup.** Shows the site's collector address, CA
     thumbprint and subscription manager string, plus the steps for each
     Windows forwarder. It can write `wef-forwarder-setup.ps1`, which is
@@ -43,7 +78,7 @@ version string yet.
 - WEF/WEC integration: a startup question (Docker sites only) asking
   whether this host manages WEF/WEC-forwarding sites, remembered in
   `~/.data-pipeline-doctor/profile`. When on, the Full diagnostic scan adds
-  a read-only WEF readiness section, and a new Docker menu option 15 offers
+  a read-only WEF readiness section, and a new Docker menu option 17 offers
   a read-only readiness check (source found, port published, checkpoint
   store, cert readability, FIPS mode, last error, forwarders seen) plus
   "Make this site WEF-ready" — applies the checkpoint store, cert mount,
@@ -79,12 +114,29 @@ version string yet.
   checkpoint store, and offers to turn FIPS off in the env file (with a
   warning, default No). It finishes with next steps: certs still to copy,
   the console source's listen address, callback and cert paths, the
-  Windows subscription manager string, and Tools 15 → 1 to verify.
+  Windows subscription manager string, and Tools 17 → 1 to verify.
   Right after this setup, the startup readiness check is skipped, because
   the console hasn't pushed the pipeline yet. (2026-10-30)
 
 ### Fixed
 
+- New Site Setup's Syslog TCP/TLS/UDP port presets published the host port
+  to a *different* container port (`514:10514`, assuming a privileged-port
+  remap inside the container). That assumption was wrong: the dataplane
+  binds directly to whatever address the console source is configured
+  with — a source on `0.0.0.0:514` is a real process bound to literal port
+  514 inside the container (confirmed via the owning PID's open file
+  descriptors), not 10514. The old preset left nothing listening on the
+  published side, so Syslog UDP traffic silently vanished with no error
+  anywhere — the tester still reported success since UDP sends don't
+  confirm delivery, and nothing showed up in SDL. Presets now publish the
+  same port on both sides (`1514:1514`, `6514:6514`, `514:514/udp`),
+  matching what the Source ports menu (option 12) already did correctly.
+  The Syslog tester's own port picker had the same remap assumption baked
+  into its matching logic and has been fixed the same way: a port is only
+  offered if the container-side port literally equals a configured
+  source's address port. Found and fixed live after a real test event
+  sent to a `514:10514` mapping never reached SDL. (2026-11-02)
 - OOM memory-limit fix now also updates `docker-compose.yml`'s `mem_limit`
   (and `memswap_limit`, if set) when the site is Compose-managed, so a live
   memory bump survives a future `docker compose up -d` recreate instead of

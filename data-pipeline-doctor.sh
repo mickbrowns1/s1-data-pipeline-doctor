@@ -87,21 +87,24 @@ _dp_gen_uuid() {
     fi
 }
 
-# Build an RFC3164 syslog line for a category, with uuid embedded in the message body.
-# $1 = category key (fw|auth|dns|web|generic)   $2 = uuid
+# Build an RFC3164 syslog line for a category, with uuid and pipeline label
+# embedded in the message body.
+# $1 = category key (fw|auth|dns|web|generic)   $2 = uuid   $3 = pipeline label (optional)
 # IPs use TEST-NET (RFC 5737) so events are obviously synthetic.
 # Returns "num_pri|logger_pri_name|tag|body" for a syslog test event.
 # Keeping the PRI numeric and name separate lets the logger path use native flags
 # (no double-encoding) while the nc path builds its own RFC3164 header.
 # IPs use TEST-NET (RFC 5737) so events are obviously synthetic.
 _dp_syslog_event() {
-    local cat="$1" uuid="$2"
+    local cat="$1" uuid="$2" pipeline="${3:-}" suffix
+    suffix="test-id=${uuid}"
+    [[ -n "$pipeline" ]] && suffix="pipeline=${pipeline} ${suffix}"
     case "$cat" in
-        fw)   printf '134|local0.info|firewall|action=DENY proto=TCP src=203.0.113.10 dst=198.51.100.5 dpt=443 test-id=%s' "$uuid" ;;
-        auth) printf '38|auth.info|sshd[4242]|Failed password for invalid user admin from 203.0.113.10 port 52311 ssh2 test-id=%s' "$uuid" ;;
-        dns)  printf '142|local1.info|named[990]|query: example.test IN A from 203.0.113.10 test-id=%s' "$uuid" ;;
-        web)  printf '134|local0.info|nginx|203.0.113.10 - - "GET /healthz HTTP/1.1" 200 12 test-id=%s' "$uuid" ;;
-        *)    printf '134|local0.info|dpd-syslog-test|synthetic test event test-id=%s' "$uuid" ;;
+        fw)   printf '134|local0.info|firewall|action=DENY proto=TCP src=203.0.113.10 dst=198.51.100.5 dpt=443 %s' "$suffix" ;;
+        auth) printf '38|auth.info|sshd[4242]|Failed password for invalid user admin from 203.0.113.10 port 52311 ssh2 %s' "$suffix" ;;
+        dns)  printf '142|local1.info|named[990]|query: example.test IN A from 203.0.113.10 %s' "$suffix" ;;
+        web)  printf '134|local0.info|nginx|203.0.113.10 - - "GET /healthz HTTP/1.1" 200 12 %s' "$suffix" ;;
+        *)    printf '134|local0.info|dpd-syslog-test|synthetic test event %s' "$suffix" ;;
     esac
 }
 
@@ -2440,7 +2443,7 @@ docker_setup_new_site() {
             _dp_env_set_openssl_conf "$env_file" "/etc/ssl/openssl.cnf.default"
             log_ok "Set OPENSSL_CONF=/etc/ssl/openssl.cnf.default in $env_file"
         else
-            log_warn "FIPS left on — the WEF source will fail to start until it's turned off (Tools 15 → 2)."
+            log_warn "FIPS left on — the WEF source will fail to start until it's turned off (Tools 17 → 2)."
         fi
         echo
     fi
@@ -2451,9 +2454,9 @@ docker_setup_new_site() {
         while true; do
             echo
             echo "    Port mapping presets:"
-            echo "      1) Syslog TCP (514:10514)"
-            echo "      2) Syslog TLS (514:10514/tls)"
-            echo "      3) Syslog UDP (514:10514/udp)"
+            echo "      1) Syslog TCP (1514:1514)"
+            echo "      2) Syslog TLS (6514:6514)"
+            echo "      3) Syslog UDP (514:514/udp)"
             echo "      4) HEC push (8088:8088)"
             echo "      5) Kafka (9092:9092)"
             echo "      6) Custom"
@@ -2463,11 +2466,19 @@ docker_setup_new_site() {
             read -rp "    Choose [0-6]: " port_choice || _dpd_eof_exit
             [[ "$port_choice" == "0" ]] && break
 
+            # Host and container port match — the dataplane binds directly to
+            # whatever address the console source is configured with, no
+            # internal remap to a different port (confirmed live: a source
+            # configured for 0.0.0.0:514 is a real PID bound to literal port
+            # 514 inside the container, not some other port — publishing
+            # host:514 to a *different* container port left nothing
+            # listening on the published side, so UDP traffic silently
+            # vanished with no error anywhere. 2026-11-02).
             local port_spec
             case "$port_choice" in
-                1) port_spec="514:10514" ;;
-                2) port_spec="514:10514" ;;  # TLS handled by container config
-                3) port_spec="514:10514/udp" ;;
+                1) port_spec="1514:1514" ;;
+                2) port_spec="6514:6514" ;;  # TLS handled by container config
+                3) port_spec="514:514/udp" ;;
                 4) port_spec="8088:8088" ;;
                 5) port_spec="9092:9092" ;;
                 6)
@@ -2659,7 +2670,7 @@ _dpd_ask_wef_mode() {
     echo "    Answer yes if Windows hosts will forward their event logs to this site."
     echo "    Doctor then sets the site up for it (port, certificate folder, checkpoint"
     echo "    store, FIPS) and checks it on every run."
-    echo -e "  ${DIM}Not sure? Answer no — you can add WEF any time later from Tools 15 →${NC}"
+    echo -e "  ${DIM}Not sure? Answer no — you can add WEF any time later from Tools 17 →${NC}"
     echo -e "  ${DIM}Make this site WEF-ready, without reinstalling.${NC}"
     echo ""
     local ans
@@ -2673,14 +2684,14 @@ _dpd_ask_wef_mode() {
     if $WEF_MODE; then
         log_ok "WEF/WEC mode on — this site will be checked for WEF readiness once its container is found."
     else
-        log_info "WEF/WEC mode off — Tools 15 is still available if you need it later."
+        log_info "WEF/WEC mode off — Tools 17 is still available if you need it later."
     fi
     echo -e "  ${DIM}Saved to ${pf} (edit or delete it to change the answer).${NC}"
 }
 
 # Runs right after docker_preflight when WEF/WEC mode is on, so a "yes" at
 # startup leads straight to the fix instead of waiting to be found under
-# Tools 15. Read-only unless the user accepts the Make-ready offer.
+# Tools 17. Read-only unless the user accepts the Make-ready offer.
 _dpd_wef_startup_check() {
     $WEF_MODE || return 0
     # Just built WEF-ready by docker_setup_new_site, which already printed the
@@ -2691,7 +2702,7 @@ _dpd_wef_startup_check() {
     echo ""
     if ! $DP_WEF_FOUND; then
         log_info "WEF/WEC: no Windows Event Forwarding source in this site's pipeline yet."
-        echo -e "  ${DIM}Add one in the console, then use Tools 15 → Make this site WEF-ready.${NC}"
+        echo -e "  ${DIM}Add one in the console, then use Tools 17 → Make this site WEF-ready.${NC}"
         pause
         return 0
     fi
@@ -2705,7 +2716,7 @@ _dpd_wef_startup_check() {
     if confirm_yes "This site isn't WEF-ready yet. Make it WEF-ready now?"; then
         docker_wef_make_ready
     else
-        log_info "Skipped — run it later from Tools 15 → 2."
+        log_info "Skipped — run it later from Tools 17 → 2."
         pause
     fi
 }
@@ -3857,6 +3868,20 @@ docker_load_component_names() {
     [[ ${#PIPELINE_NAME_MAP[@]} -gt 0 ]] && log_info "Loaded ${#PIPELINE_NAME_MAP[@]} component name(s) from $f"
 }
 
+# Human-readable label for a source key (e.g. "100000000000003417_source"),
+# for embedding in test events so a multi-source site's events are
+# identifiable at a glance. Loads PIPELINE_NAME_MAP on first use (cheap: a
+# no-op if the optional names file doesn't exist). Falls back to the bare
+# entity id if no name is mapped, and strips quotes/backslashes so the
+# result is always safe to embed in either a JSON string or a syslog line.
+_dp_pipeline_label_for_key() {
+    local key="$1" eid label
+    [[ ${#PIPELINE_NAME_MAP[@]} -eq 0 ]] && docker_load_component_names
+    eid="${key%%_*}"
+    label="$(_name_for_entity "$eid")" || label="$eid"
+    printf '%s' "$label" | tr -d '"\\'
+}
+
 # Map a raw connector type to a human label (per the GA connector vocabulary).
 # Unknown/internal types pass through unchanged.
 _friendly_type() {
@@ -4645,7 +4670,7 @@ _dp_wef_print_next_steps() {
     if [[ ${#missing[@]} -gt 0 ]]; then
         echo "    1. Copy the server certificate, key, and CA into ${cert_dir}:"
         echo "         ${missing[*]}"
-        echo "       Then re-run Doctor (or Tools 15 → 2) to set ownership for the container."
+        echo "       Then re-run Doctor (or Tools 17 → 2) to set ownership for the container."
     else
         echo "    1. Certificates found in ${cert_dir} — ownership set for the container."
     fi
@@ -4655,7 +4680,7 @@ _dp_wef_print_next_steps() {
     echo "         CA / cert / key:    ${cert_dir}/ca.crt, ${cert_dir}/server.crt, ${cert_dir}/server.key"
     echo "    3. Point the Windows subscription manager at:"
     echo "         Server=https://${fqdn}:${port}/wsman/SubscriptionManager/WEC,Refresh=60,IssuerCA=<CA thumbprint>"
-    echo "    4. Check it with Tools 15 → 1 (readiness check) once the source is deployed."
+    echo "    4. Check it with Tools 17 → 1 (readiness check) once the source is deployed."
     echo ""
 }
 
@@ -4939,7 +4964,7 @@ docker_wef_forwarder_setup() {
 
     echo -e "  ${BOLD}Values for this site${NC}"
     echo "    Collector address:   ${host}:${port}"
-    echo "    CA thumbprint:       ${thumb:-(could not read — check the CA file is readable, Tools 15 → 1)}"
+    echo "    CA thumbprint:       ${thumb:-(could not read — check the CA file is readable, Tools 17 → 1)}"
     echo "    Subscription manager:"
     echo -e "      ${CYAN}${sub}${NC}"
     echo ""
@@ -5052,7 +5077,7 @@ docker_wef_tls_test() {
         log_err "Could not identify the CA, certificate and key paths from the source config"
         ((problems++))
     elif ! dexec test -r "$DP_WEF_CRT" 2>/dev/null; then
-        log_err "Certificate files aren't readable inside the container — run Tools 15 → 2 first"
+        log_err "Certificate files aren't readable inside the container — run Tools 17 → 2 first"
         ((problems++))
     else
         local subj san end
@@ -5102,7 +5127,7 @@ docker_wef_tls_test() {
     if [[ "$hs" == *"Verify return code: 0 (ok)"* ]]; then
         log_ok "TLS handshake on container port ${cport} succeeded ($(echo "$hs" | grep -m1 -oE 'TLSv1\.[0-3]'), verified against the CA)"
     elif [[ -z "$hs" || "$hs" == *"Connection refused"* || "$hs" == *"errno=111"* ]]; then
-        log_err "Nothing is listening on container port ${cport} — the WEF source isn't running (check Tools 15 → 1 for the last error)"
+        log_err "Nothing is listening on container port ${cport} — the WEF source isn't running (check Tools 17 → 1 for the last error)"
         ((problems++))
     else
         log_err "TLS handshake on container port ${cport} failed: $(echo "$hs" | grep -m1 -E 'Verify return code|error|errno' | cut -c1-120)"
@@ -5131,7 +5156,7 @@ docker_wef_tls_test() {
 
     echo ""
     if [[ $problems -eq 0 ]]; then
-        log_ok "TLS endpoint looks good. If forwarders still don't connect, check their side (Tools 15 → 3)."
+        log_ok "TLS endpoint looks good. If forwarders still don't connect, check their side (Tools 17 → 3)."
     else
         log_err "${problems} problem(s) found."
     fi
@@ -5244,36 +5269,248 @@ docker_menu_wef() {
     done
 }
 
-# Pick a syslog-capable published port for the current container.
-# Sets DP_SYSLOG_PORT and DP_SYSLOG_PROTO on success; returns 1 on cancel / none found.
-# Auto-selects when only one candidate, otherwise offers a menu.
-_dp_pick_syslog_port() {
-    # Collect syslog-capable published ports (skip HEC push and Kafka which have dedicated ports).
-    local entries=() hports=() protos=() hip hport cport role label
-    while IFS='|' read -r hip hport cport; do
-        [[ -z "$cport" ]] && continue
-        role="$(_dp_port_role "$cport" "$hport")"
-        case "$role" in
-            "HEC push"|"Kafka") continue ;;
+# ============================================================
+#  HEC push integration — shared read-only helper
+# ============================================================
+# Block-scoped read of every `type: splunk_hec` source under `sources:` in
+# the container's own resolved /etc/dataplane/config.yaml, confirmed against
+# a real file on a live site (2026-11-02) — same approach as
+# _dp_wef_read_config. Deliberately does NOT match `splunk_hec_logs`, which
+# is an outbound sink (destination), not a push source, and lives under
+# `sinks:`, not `sources:`. Sets three parallel arrays, one entry per HEC
+# source found: DP_HEC_KEYS (source key), DP_HEC_ADDR (container-side
+# "host:port" from its address: line), DP_HEC_TLS (its tls.enabled value,
+# "false" if no tls: block is present), DP_HEC_TOKEN (first entry under
+# valid_tokens:). Never prints a token — callers that need it read it from
+# DP_HEC_TOKEN directly and must not echo it back to the console.
+_dp_hec_read_config() {
+    DP_HEC_KEYS=()
+    DP_HEC_ADDR=()
+    DP_HEC_TLS=()
+    DP_HEC_TOKEN=()
+
+    local cfg
+    cfg=$(dexec sh -c "cat /etc/dataplane/config.yaml /etc/collector/config.yaml 2>/dev/null" 2>/dev/null)
+    [[ -z "$cfg" ]] && return 1
+
+    local parsed
+    parsed=$(echo "$cfg" | awk '
+        function flush() {
+            if (ishec) print "HEC_KEY=" key "\nHEC_ADDR=" addr "\nHEC_TLS=" tls "\nHEC_TOKEN=" token "\nHEC_END=1"
+            ishec=0; key=""; addr=""; tls="false"; token=""
+        }
+        /^sources:/ { insrc=1; next }
+        /^[^ ]/ { if (insrc) flush(); insrc=0 }
+        insrc && /^  [^ ]/ {
+            flush()
+            k=$0; sub(/^  /,"",k); sub(/:[ ]*$/,"",k); gsub(/"/,"",k); key=k
+            next
+        }
+        insrc && /^    type:[ ]*splunk_hec[ ]*$/ { ishec=1 }
+        insrc && /^    address:/ { sub(/^    address:[ ]*/,""); addr=$0 }
+        insrc && /^      enabled:/ { sub(/^      enabled:[ ]*/,""); tls=$0 }
+        insrc && /^    - / && token=="" { sub(/^    - /,""); gsub(/"/,"",$0); token=$0 }
+        END { if (insrc) flush() }
+    ')
+    [[ -z "$parsed" ]] && return 1
+
+    local line key="" addr="" tls="false" token=""
+    while IFS= read -r line; do
+        case "$line" in
+            HEC_KEY=*)   key="${line#HEC_KEY=}" ;;
+            HEC_ADDR=*)  addr="${line#HEC_ADDR=}" ;;
+            HEC_TLS=*)   tls="${line#HEC_TLS=}" ;;
+            HEC_TOKEN=*) token="${line#HEC_TOKEN=}" ;;
+            HEC_END=*)
+                DP_HEC_KEYS+=("$key"); DP_HEC_ADDR+=("$addr")
+                DP_HEC_TLS+=("$tls"); DP_HEC_TOKEN+=("$token")
+                key=""; addr=""; tls="false"; token=""
+                ;;
         esac
-        if [[ "$role" == Syslog* ]]; then
-            label="host ${hport} → container ${cport}  (${role})"
-        else
-            label="host ${hport} → container ${cport}  (custom)"
-        fi
-        entries+=("$label")
-        hports+=("$hport")
-        protos+=("${cport##*/}")
-    done < <(dinspect '{{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostIp}}|{{.HostPort}}|{{$p}}{{println}}{{end}}{{end}}')
+    done <<< "$parsed"
+
+    [[ ${#DP_HEC_KEYS[@]} -gt 0 ]]
+}
+
+# Pick a published, HEC-push-capable source for the current container.
+# Sets DP_HEC_PORT, DP_HEC_TOKEN_SEL, DP_HEC_TLS_SEL on success; returns 1 on
+# cancel / none found. Auto-selects when only one candidate.
+# Deliberately scoped to sources the config + host port bindings both agree
+# on — a HEC source with no published host port can't be tested yet, so it's
+# excluded here rather than offered and failing later.
+_dp_pick_hec_source() {
+    _dp_hec_read_config
+    if [[ ${#DP_HEC_KEYS[@]} -eq 0 ]]; then
+        log_warn "No HEC push source found in this site's pipeline."
+        echo -e "  ${DIM}Add a Splunk HEC-push source in the console first.${NC}"
+        pause; return 1
+    fi
+
+    local entries=() hports=() tokens=() tlsflags=() keys=()
+    local i cport hip hport cport2 matched_hport tls_tag
+    for i in "${!DP_HEC_KEYS[@]}"; do
+        cport="${DP_HEC_ADDR[$i]##*:}"
+        [[ "$cport" =~ ^[0-9]+$ ]] || continue
+        matched_hport=""
+        while IFS='|' read -r hip hport cport2; do
+            [[ -z "$cport2" ]] && continue
+            [[ "${cport2%%/*}" == "$cport" ]] && matched_hport="$hport"
+        done < <(dinspect '{{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostIp}}|{{.HostPort}}|{{$p}}{{println}}{{end}}{{end}}')
+        [[ -z "$matched_hport" ]] && continue
+
+        tls_tag=""
+        [[ "${DP_HEC_TLS[$i]}" == "true" ]] && tls_tag=" · TLS"
+        entries+=("host ${matched_hport} → container ${cport}  (HEC push${tls_tag})")
+        hports+=("$matched_hport")
+        tokens+=("${DP_HEC_TOKEN[$i]}")
+        tlsflags+=("${DP_HEC_TLS[$i]}")
+        keys+=("${DP_HEC_KEYS[$i]}")
+    done
 
     if [[ ${#entries[@]} -eq 0 ]]; then
-        log_warn "No syslog-capable published ports found."
-        echo -e "  ${DIM}Use option 12 — Source ports to publish one first.${NC}"
+        log_warn "Found a HEC source in the config, but its container port isn't published on the host."
+        echo -e "  ${DIM}Use option 12 — Source ports to publish it first.${NC}"
         pause; return 1
     fi
 
     if [[ ${#entries[@]} -eq 1 ]]; then
-        DP_SYSLOG_PORT="${hports[0]}"; DP_SYSLOG_PROTO="${protos[0]}"
+        DP_HEC_PORT="${hports[0]}"; DP_HEC_TOKEN_SEL="${tokens[0]}"; DP_HEC_TLS_SEL="${tlsflags[0]}"
+        DP_HEC_KEY_SEL="${keys[0]}"
+        log_info "Using the only available HEC source: host ${DP_HEC_PORT}"
+        echo ""
+        return 0
+    fi
+
+    local src_count="${#entries[@]}" src_choice
+    entries+=("Back")
+    src_choice=$(pick_one "Which HEC source to send to?" "${entries[@]}")
+    if [[ ! "$src_choice" =~ ^[0-9]+$ || "$src_choice" -gt "$src_count" || "$src_choice" -lt 1 ]]; then
+        return 1
+    fi
+    DP_HEC_PORT="${hports[$(( src_choice - 1 ))]}"
+    DP_HEC_TOKEN_SEL="${tokens[$(( src_choice - 1 ))]}"
+    DP_HEC_TLS_SEL="${tlsflags[$(( src_choice - 1 ))]}"
+    DP_HEC_KEY_SEL="${keys[$(( src_choice - 1 ))]}"
+    return 0
+}
+
+# Block-scoped read of every `type: socket` source under `sources:` in the
+# container's own resolved /etc/dataplane/config.yaml — the raw TCP/UDP
+# listener type the console uses for Syslog (and CEF/LEEF, which rides the
+# same transport). Same approach as _dp_hec_read_config / _dp_wef_read_config.
+# Sets parallel arrays, one entry per socket source found: DP_SYSLOG_KEYS
+# (source key), DP_SYSLOG_ADDR (container-side "host:port"), DP_SYSLOG_MODE
+# (its mode: tcp|udp, "tcp" if unspecified).
+_dp_syslog_read_config() {
+    DP_SYSLOG_KEYS=()
+    DP_SYSLOG_ADDR=()
+    DP_SYSLOG_MODE=()
+
+    local cfg
+    cfg=$(dexec sh -c "cat /etc/dataplane/config.yaml /etc/collector/config.yaml 2>/dev/null" 2>/dev/null)
+    [[ -z "$cfg" ]] && return 1
+
+    local parsed
+    parsed=$(echo "$cfg" | awk '
+        function flush() {
+            if (issock) print "SOCK_KEY=" key "\nSOCK_ADDR=" addr "\nSOCK_MODE=" mode "\nSOCK_END=1"
+            issock=0; key=""; addr=""; mode="tcp"
+        }
+        /^sources:/ { insrc=1; next }
+        /^[^ ]/ { if (insrc) flush(); insrc=0 }
+        insrc && /^  [^ ]/ {
+            flush()
+            k=$0; sub(/^  /,"",k); sub(/:[ ]*$/,"",k); gsub(/"/,"",k); key=k
+            next
+        }
+        insrc && /^    type:[ ]*socket[ ]*$/ { issock=1 }
+        insrc && /^    address:/ { sub(/^    address:[ ]*/,""); addr=$0 }
+        insrc && /^    mode:/ { sub(/^    mode:[ ]*/,""); mode=$0 }
+        END { if (insrc) flush() }
+    ')
+    [[ -z "$parsed" ]] && return 1
+
+    local line key="" addr="" mode="tcp"
+    while IFS= read -r line; do
+        case "$line" in
+            SOCK_KEY=*)  key="${line#SOCK_KEY=}" ;;
+            SOCK_ADDR=*) addr="${line#SOCK_ADDR=}" ;;
+            SOCK_MODE=*) mode="${line#SOCK_MODE=}" ;;
+            SOCK_END=*)
+                DP_SYSLOG_KEYS+=("$key"); DP_SYSLOG_ADDR+=("$addr"); DP_SYSLOG_MODE+=("$mode")
+                key=""; addr=""; mode="tcp"
+                ;;
+        esac
+    done <<< "$parsed"
+
+    [[ ${#DP_SYSLOG_KEYS[@]} -gt 0 ]]
+}
+
+# Pick a published, syslog-source-backed port for the current container.
+# Sets DP_SYSLOG_PORT and DP_SYSLOG_PROTO on success; returns 1 on cancel /
+# none found. Auto-selects when only one candidate, otherwise offers a menu.
+#
+# Gated on _dp_syslog_read_config finding at least one real socket source —
+# no bare "(custom)" fallback for an arbitrary published port anymore.
+# Matching requires the published container port to literally equal the
+# source's own configured address port — no remap fudging. An earlier
+# version of this function (and the New Site Setup port presets) assumed
+# a privileged port like 514/udp gets remapped to an unprivileged one
+# inside the container (e.g. 10514/udp) and matched either number. That
+# assumption was wrong: the dataplane binds directly to the literal
+# configured address — a source on 0.0.0.0:514 is a real process bound to
+# port 514 inside the container, confirmed via the owning PID's open file
+# descriptors, not some other port. A host:514 -> container:10514 mapping
+# (from the old preset) left nothing listening on the published side, so
+# UDP traffic silently vanished — no error anywhere, success reported
+# locally regardless, confirmed live only after cross-checking in SDL.
+# _dp_port_role's static table is display-only now (used by Source ports
+# to label an existing mapping); it no longer drives this picker, since
+# it would otherwise offer the exact broken 514->10514 shape this fixes.
+# (2026-11-02)
+_dp_pick_syslog_port() {
+    _dp_syslog_read_config
+    if [[ ${#DP_SYSLOG_KEYS[@]} -eq 0 ]]; then
+        log_warn "No Syslog/CEF/LEEF source found in this site's pipeline."
+        echo -e "  ${DIM}Add a Syslog (or CEF/LEEF) source in the console first.${NC}"
+        pause; return 1
+    fi
+
+    local entries=() hports=() protos=() keys=() hip hport cport role label
+    local i cfgport mode match rawport
+    while IFS='|' read -r hip hport cport; do
+        [[ -z "$cport" ]] && continue
+        rawport="${cport%%/*}"
+
+        match=false
+        for i in "${!DP_SYSLOG_KEYS[@]}"; do
+            cfgport="${DP_SYSLOG_ADDR[$i]##*:}"
+            if [[ "$cfgport" == "$rawport" ]]; then
+                match=true; mode="${DP_SYSLOG_MODE[$i]}"; break
+            fi
+        done
+        $match || continue
+
+        role="$(_dp_port_role "$cport" "$hport")"
+        if [[ "$role" == Syslog* ]]; then
+            label="host ${hport} → container ${cport}  (${role})"
+        else
+            label="host ${hport} → container ${cport}  (Syslog ${mode^^})"
+        fi
+        entries+=("$label")
+        hports+=("$hport")
+        protos+=("${cport##*/}")
+        keys+=("${DP_SYSLOG_KEYS[$i]}")
+    done < <(dinspect '{{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostIp}}|{{.HostPort}}|{{$p}}{{println}}{{end}}{{end}}')
+
+    if [[ ${#entries[@]} -eq 0 ]]; then
+        log_warn "Found a Syslog/CEF/LEEF source in the config, but its container port isn't published on the host."
+        echo -e "  ${DIM}Use option 12 — Source ports to publish it first.${NC}"
+        pause; return 1
+    fi
+
+    if [[ ${#entries[@]} -eq 1 ]]; then
+        DP_SYSLOG_PORT="${hports[0]}"; DP_SYSLOG_PROTO="${protos[0]}"; DP_SYSLOG_KEY_SEL="${keys[0]}"
         log_info "Using the only available port: host ${DP_SYSLOG_PORT} (${DP_SYSLOG_PROTO})"
         echo ""
         return 0
@@ -5287,6 +5524,7 @@ _dp_pick_syslog_port() {
     fi
     DP_SYSLOG_PORT="${hports[$(( port_choice - 1 ))]}"
     DP_SYSLOG_PROTO="${protos[$(( port_choice - 1 ))]}"
+    DP_SYSLOG_KEY_SEL="${keys[$(( port_choice - 1 ))]}"
     return 0
 }
 
@@ -5297,6 +5535,7 @@ docker_menu_syslog_test() {
 
     _dp_pick_syslog_port || return
     local port="$DP_SYSLOG_PORT" proto="$DP_SYSLOG_PROTO"
+    local pipeline; pipeline="$(_dp_pipeline_label_for_key "$DP_SYSLOG_KEY_SEL"):${port}"
 
     # Pick event category.
     local cat_choice cat
@@ -5319,11 +5558,11 @@ docker_menu_syslog_test() {
     # Generate UUID, build and send the event.
     local UUID event body_preview
     UUID="$(_dp_gen_uuid)"
-    event="$(_dp_syslog_event "$cat" "$UUID")"
+    event="$(_dp_syslog_event "$cat" "$UUID" "$pipeline")"
     body_preview="${event##*|}"
 
     echo ""
-    log_info "Sending to localhost:${port}/${proto}"
+    log_info "Sending to localhost:${port}/${proto} (pipeline: ${pipeline})"
     echo -e "  ${DIM}${body_preview}${NC}"
     echo ""
 
@@ -5350,6 +5589,7 @@ docker_menu_syslog_stream() {
 
     _dp_pick_syslog_port || return
     local port="$DP_SYSLOG_PORT" proto="$DP_SYSLOG_PROTO"
+    local pipeline; pipeline="$(_dp_pipeline_label_for_key "$DP_SYSLOG_KEY_SEL"):${port}"
 
     # Pick event category.
     local cat_choice cat
@@ -5384,7 +5624,7 @@ docker_menu_syslog_stream() {
     UUID="$(_dp_gen_uuid)"
 
     echo ""
-    log_info "Streaming ${cat} events to localhost:${port}/${proto} every ${rate}s."
+    log_info "Streaming ${cat} events to localhost:${port}/${proto} every ${rate}s (pipeline: ${pipeline})."
     echo -e "  ${DIM}Open a log preview / Tail (option 10) in the Observo UI now — press Ctrl-C to stop.${NC}"
     echo -e "  ${DIM}Find this batch in SDL Event ALL Search: message contains '${UUID}'${NC}"
     echo ""
@@ -5394,7 +5634,7 @@ docker_menu_syslog_stream() {
     local sent=0 fails=0 stop=0 event
     trap 'stop=1' INT
     while [[ "$stop" -eq 0 ]]; do
-        event="$(_dp_syslog_event "$cat" "$UUID")"
+        event="$(_dp_syslog_event "$cat" "$UUID" "$pipeline")"
         if _dp_send_syslog "$event" "$port" "$proto" >/dev/null 2>&1; then
             sent=$(( sent + 1 ))
         else
@@ -5420,6 +5660,131 @@ docker_menu_syslog_stream() {
     pause
 }
 
+# Build a Splunk HEC /services/collector/event JSON body with uuid (and,
+# when known, the pipeline name) embedded in the event text, so the test
+# event is findable the same way the syslog tester's events are: 'message
+# contains <uuid>' in SDL Event ALL Search.
+_dp_hec_event_body() {
+    local uuid="$1" pipeline="${2:-}" suffix
+    suffix="test-id=${uuid}"
+    [[ -n "$pipeline" ]] && suffix="pipeline=${pipeline} ${suffix}"
+    printf '{"event":"dpd HEC test event %s","sourcetype":"dpd:test"}' "$suffix"
+}
+
+# Send one HEC test event. $1 = uuid  $2 = port  $3 = token  $4 = tls (true|false)  $5 = pipeline label (optional)
+# Never echoes the token — it goes straight into the curl arg vector, never
+# printed. -k accepts a self-signed cert; this is a connectivity/auth probe,
+# not a certificate validator (TLS & certificates, option 4, covers that).
+_dp_send_hec() {
+    local uuid="$1" port="$2" token="$3" tls="$4" pipeline="${5:-}" scheme="http"
+    [[ "$tls" == "true" ]] && scheme="https"
+    local code
+    code=$(curl -s -o /dev/null -w '%{http_code}' -k --connect-timeout 5 --max-time 10 \
+        -X POST "${scheme}://localhost:${port}/services/collector/event" \
+        -H "Authorization: Splunk ${token}" \
+        -H "Content-Type: application/json" \
+        -d "$(_dp_hec_event_body "$uuid" "$pipeline")" 2>/dev/null || echo "000")
+    echo "$code"
+}
+
+docker_menu_hec_test() {
+    banner
+    echo -e "  ${BOLD}HEC Tester — $DOCKER_CONTAINER${NC}"
+    echo ""
+
+    _dp_pick_hec_source || return
+    local port="$DP_HEC_PORT" token="$DP_HEC_TOKEN_SEL" tls="$DP_HEC_TLS_SEL"
+    local pipeline; pipeline="$(_dp_pipeline_label_for_key "$DP_HEC_KEY_SEL"):${port}"
+    local scheme="http"; [[ "$tls" == "true" ]] && scheme="https"
+
+    local UUID code
+    UUID="$(_dp_gen_uuid)"
+
+    echo ""
+    log_info "Sending to ${scheme}://localhost:${port}/services/collector/event (pipeline: ${pipeline})"
+    echo ""
+
+    code="$(_dp_send_hec "$UUID" "$port" "$token" "$tls" "$pipeline")"
+    case "$code" in
+        2*)
+            log_ok "HEC accepted the event (HTTP ${code})."
+            echo -e "  ${DIM}Watch it arrive: Docker menu option 10 — Tail sources & destinations.${NC}"
+            echo ""
+            echo "Use the following in SDL Event ALL Search to locate the test event: message contains '${UUID}'"
+            echo ""
+            ;;
+        403|401)
+            log_err "HEC rejected the event (HTTP ${code}) — the token read from the dataplane config doesn't match what the endpoint expects."
+            ;;
+        000)
+            log_err "Failed to reach the HEC endpoint — check that the port is published and a listener is up."
+            ;;
+        *)
+            log_err "HEC returned HTTP ${code} — unexpected response."
+            ;;
+    esac
+    pause
+}
+
+# Continuous generator: send a fresh HEC event every N seconds until Ctrl-C.
+# Same rationale as docker_menu_syslog_stream — a steady trickle keeps a log
+# preview / dataplane tap non-idle instead of racing one-shot sends.
+docker_menu_hec_stream() {
+    banner
+    echo -e "  ${BOLD}HEC Stream (continuous) — $DOCKER_CONTAINER${NC}"
+    echo ""
+
+    _dp_pick_hec_source || return
+    local port="$DP_HEC_PORT" token="$DP_HEC_TOKEN_SEL" tls="$DP_HEC_TLS_SEL"
+    local pipeline; pipeline="$(_dp_pipeline_label_for_key "$DP_HEC_KEY_SEL"):${port}"
+    local scheme="http"; [[ "$tls" == "true" ]] && scheme="https"
+
+    local rate
+    read -rp "  Seconds between events [1]: " rate || _dpd_eof_exit
+    [[ -z "$rate" ]] && rate=1
+    if [[ ! "$rate" =~ ^[0-9]+$ ]] || [[ "$rate" -lt 1 ]]; then
+        log_warn "Invalid interval — using 1 second."
+        rate=1
+    fi
+
+    local UUID
+    UUID="$(_dp_gen_uuid)"
+
+    echo ""
+    log_info "Streaming HEC events to ${scheme}://localhost:${port}/services/collector/event every ${rate}s (pipeline: ${pipeline})."
+    echo -e "  ${DIM}Open a log preview / Tail (option 10) in the Observo UI now — press Ctrl-C to stop.${NC}"
+    echo -e "  ${DIM}Find this batch in SDL Event ALL Search: message contains '${UUID}'${NC}"
+    echo ""
+
+    local sent=0 fails=0 stop=0 code
+    trap 'stop=1' INT
+    while [[ "$stop" -eq 0 ]]; do
+        code="$(_dp_send_hec "$UUID" "$port" "$token" "$tls" "$pipeline")"
+        if [[ "$code" =~ ^2 ]]; then
+            sent=$(( sent + 1 ))
+        else
+            fails=$(( fails + 1 ))
+        fi
+        printf "\r  ${DIM}sent %d   failed %d${NC}   " "$sent" "$fails"
+        [[ "$stop" -eq 1 ]] && break
+        sleep "$rate"
+    done
+    trap - INT
+
+    echo ""
+    echo ""
+    if [[ "$sent" -gt 0 ]]; then
+        if [[ "$fails" -gt 0 ]]; then
+            log_ok "Stream stopped — ${sent} event(s) sent, ${fails} failed."
+        else
+            log_ok "Stream stopped — ${sent} event(s) sent."
+        fi
+    else
+        log_err "Stream stopped — no events sent (${fails} failed). Check the port is published, the token is valid, and a listener is up."
+    fi
+    pause
+}
+
 docker_main_menu() {
     while true; do
         banner
@@ -5439,19 +5804,20 @@ docker_main_menu() {
         printf "    ${CYAN}%2s)${NC} %-30s ${CYAN}%2s)${NC} %s\n" 9 "Restart service/container" 10 "Tail sources & destinations"
         printf "    ${CYAN}%2s)${NC} %-30s ${CYAN}%2s)${NC} %s\n" 11 "Proxy & connectivity" 12 "Source ports"
         printf "    ${CYAN}%2s)${NC} %-30s ${CYAN}%2s)${NC} %s\n" 13 "Syslog tester" 14 "Syslog stream (continuous)"
+        printf "    ${CYAN}%2s)${NC} %-30s ${CYAN}%2s)${NC} %s\n" 15 "HEC tester" 16 "HEC stream (continuous)"
         local wef_label="WEF/WEC integration"
         if $WEF_MODE; then
             _dp_wef_check
             [[ $DP_WEF_ISSUES -gt 0 ]] && wef_label="WEF/WEC integration (${DP_WEF_ISSUES} issue$([[ $DP_WEF_ISSUES -eq 1 ]] || echo s))"
         fi
-        printf "    ${CYAN}%2s)${NC} %s\n" 15 "$wef_label"
+        printf "    ${CYAN}%2s)${NC} %s\n" 17 "$wef_label"
         echo ""
         hr
         echo ""
         echo -e "    ${CYAN} 0)${NC} Exit"
         echo ""
         local choice
-        read -rp "  Choose [0-15]: " choice || { echo ""; log_info "Goodbye."; exit 0; }
+        read -rp "  Choose [0-17]: " choice || { echo ""; log_info "Goodbye."; exit 0; }
         case "$choice" in
             1)  docker_full_scan ;;
             2)  docker_run_scan docker_scan_services "Service Health (s6)" ;;
@@ -5467,7 +5833,9 @@ docker_main_menu() {
             12) docker_menu_source_ports ;;
             13) docker_menu_syslog_test ;;
             14) docker_menu_syslog_stream ;;
-            15) docker_menu_wef ;;
+            15) docker_menu_hec_test ;;
+            16) docker_menu_hec_stream ;;
+            17) docker_menu_wef ;;
             0)  echo ""; log_info "Goodbye."; exit 0 ;;
             *)  ;;
         esac

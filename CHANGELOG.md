@@ -120,6 +120,19 @@ version string yet.
 
 ### Fixed
 
+- Make this site WEF-ready (Tools 17 → 2) no longer "succeeds" with a plain
+  restart when the running container is stale. It used to decide nothing needed
+  changing by comparing the Compose and env *files* before and after its own
+  edits; when those files already held the changes (another host's Doctor, a
+  file sync, or a hand edit got there first) it only ran `docker restart`,
+  which never applies Compose or env changes, so the container kept running
+  with no cert mount, no checkpoint store, FIPS on, and its port unpublished.
+  It now restarts only when the container already has the checkpoint mount, no
+  FIPS change is pending, and the cert directory is mounted (a permissions-only
+  problem); in every other case `docker compose up -d` recreates it. Normal
+  single-site behavior is unchanged. Reproduced by rebuilding a standby from a
+  pre-WEF compose backup while the real compose file was current: the patched
+  Make-ready recreated it with both mounts. (2026-11-03)
 - New Site Setup's Syslog TCP/TLS/UDP port presets published the host port
   to a *different* container port (`514:10514`, assuming a privileged-port
   remap inside the container). That assumption was wrong: the dataplane

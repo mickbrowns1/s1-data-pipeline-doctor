@@ -4844,10 +4844,26 @@ docker_wef_make_ready() {
         # neither the compose file nor the env file changes, so `up -d` is a
         # no-op. But the WEF source has already stopped on the cert error and
         # doesn't retry, so the container still needs a restart.
+        #
+        # "Files unchanged" is NOT enough to justify a restart: the files can
+        # already hold the changes (another host's Doctor edited them, a file
+        # sync copied them over, someone edited by hand) while the RUNNING
+        # container is still the old one. A restart never applies compose/env
+        # changes, so only restart when the container itself already has the
+        # checkpoint mount, no FIPS change is pending, and the cert directory
+        # is mounted (the only problem left is file permissions). Otherwise
+        # `up -d` recreates it, since Compose compares against the live container.
+        local needs_recreate=false
+        $need_checkpoint && needs_recreate=true
+        $need_fips && needs_recreate=true
+        if $need_certs; then
+            dinspect '{{range .Mounts}}{{.Destination}}{{println}}{{end}}' | grep -qxF "$cert_dst_dir" \
+                || needs_recreate=true
+        fi
         local unchanged=false
         cmp -s "$compose_file" "$compose_backup" \
             && { [[ -z "$env_backup" ]] || cmp -s "$env_file" "$env_backup"; } && unchanged=true
-        if $unchanged; then
+        if $unchanged && ! $needs_recreate; then
             rm -f "$compose_backup" "${env_backup:-}"
             if docker restart "$DOCKER_CONTAINER" >/dev/null 2>&1; then
                 log_fix "Restarted $DOCKER_CONTAINER so the WEF source starts with the fixed certificate permissions (no config change was needed)."

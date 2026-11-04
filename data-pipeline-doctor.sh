@@ -4242,6 +4242,23 @@ _dp_compose_info() {
     return 0
 }
 
+# Resolve a symlinked config file to its real path, and leave everything else
+# alone. The compose/env helpers below edit by writing a temp file and
+# renaming it over the original (awk > file.tmp && mv, sed -i). A rename onto
+# a symlink replaces the symlink itself, so a site whose env/compose file is
+# symlinked (e.g. into a shared NFS mount) would silently end up with a local
+# copy and stop sharing. Only a symlink is rewritten: a regular file's path
+# comes back exactly as given, so normal installs behave as before. If the
+# link can't be resolved (readlink -f is missing on older macOS), the
+# original path is used.
+_dp_real_path() {
+    local f="$1" r
+    if [[ -L "$f" ]]; then
+        r=$(readlink -f "$f" 2>/dev/null) && [[ -n "$r" ]] && { printf '%s' "$r"; return; }
+    fi
+    printf '%s' "$f"
+}
+
 # Add a "-p"-style port mapping to a Compose file's service, so a future
 # `docker compose up -d` doesn't silently drop ports added via this menu.
 # Creates the `ports:` key if it's missing; idempotent (skips if the exact
@@ -4249,6 +4266,7 @@ _dp_compose_info() {
 # generates (2-space service indent, 4-space key indent under it).
 _dp_compose_add_port() {
     local file="$1" newmap="$2"
+    file=$(_dp_real_path "$file")
     if grep -qF "\"${newmap}\"" "$file"; then
         return 0   # already present
     fi
@@ -4277,6 +4295,7 @@ _dp_compose_add_port() {
 # that only bumps --memory, not --memory-swap).
 _dp_compose_set_mem_limit() {
     local file="$1" mem="$2" memswap="$3"
+    file=$(_dp_real_path "$file")
 
     if grep -qE '^[[:space:]]*mem_limit:' "$file"; then
         awk -v mem="$mem" '
@@ -4324,6 +4343,7 @@ _dp_compose_set_mem_limit() {
 # top-level `volumes:` block and corrupt it.
 _dp_compose_add_mount() {
     local file="$1" host_path="$2" container_path="$3" mode="${4:-}"
+    file=$(_dp_real_path "$file")
     local spec="${host_path}:${container_path}"
     [[ -n "$mode" ]] && spec="${spec}:${mode}"
 
@@ -4358,6 +4378,7 @@ _dp_compose_add_mount() {
 # value winning).
 _dp_compose_set_env() {
     local file="$1" key="$2" value="$3"
+    file=$(_dp_real_path "$file")
     if grep -qE "^[[:space:]]*- \"${key}=" "$file"; then
         awk -v key="$key" -v value="$value" '
             $0 ~ ("^[[:space:]]*- \"" key "=") { print "      - \"" key "=" value "\""; next }
@@ -4650,6 +4671,7 @@ _dp_wef_fix_cert_perms() {
 # Set OPENSSL_CONF in a site env file (replace the line, or append it).
 _dp_env_set_openssl_conf() {
     local env_file="$1" value="$2"
+    env_file=$(_dp_real_path "$env_file")
     if grep -qE '^OPENSSL_CONF=' "$env_file"; then
         sed -i.dpdtmp "s#^OPENSSL_CONF=.*#OPENSSL_CONF=${value}#" "$env_file" && rm -f "${env_file}.dpdtmp"
     else

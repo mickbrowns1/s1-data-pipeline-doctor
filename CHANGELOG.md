@@ -120,6 +120,17 @@ version string yet.
 
 ### Fixed
 
+- Doctor no longer replaces a symlinked env or compose file with a local copy
+  when it edits it. The compose helpers (open a port, set the memory limit, add
+  a mount, set an environment value) write a temp file and `mv` it over the
+  original, and the FIPS env edit uses `sed -i`; a rename onto a symlink
+  replaces the symlink itself, so a site whose `~/ai-data-pipelines.env` or
+  `~/docker-compose-observo.yml` pointed at a shared (e.g. NFS) copy silently
+  stopped sharing on the first edit. A new `_dp_real_path` helper resolves a
+  file to its real path only when it is a symlink, so regular files take the
+  exact same path as before (verified byte-identical output on Debian and
+  Fedora). If `readlink -f` is unavailable the original path is used.
+  (2026-11-03)
 - Make this site WEF-ready (Tools 17 → 2) no longer "succeeds" with a plain
   restart when the running container is stale. It used to decide nothing needed
   changing by comparing the Compose and env *files* before and after its own

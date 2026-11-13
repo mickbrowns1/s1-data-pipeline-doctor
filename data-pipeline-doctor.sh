@@ -2376,6 +2376,7 @@ docker_setup_new_site() {
         log_ok "Found $env_file"
     fi
     chmod 600 "$env_file"
+    _dpd_chown_back "$env_file"   # under sudo, keep it the login user's, or `docker compose` as them can't read it
     echo
 
     # Parse credentials from comment header — the .env file embeds docker login details
@@ -2536,6 +2537,7 @@ COMPOSE
 volumes:
   observo-data:
 COMPOSE
+        _dpd_chown_back "$compose_file"   # same reason as the env file above
         log_ok "Created: $compose_file"
 
         if ! docker compose version >/dev/null 2>&1; then
@@ -2642,6 +2644,29 @@ _dpd_chown_back() {
     [[ ${EUID:-$(id -u)} -eq 0 && -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]] || return 0
     # user:group, not just user — otherwise the file keeps root's group.
     chown "$SUDO_USER:$(id -gn "$SUDO_USER" 2>/dev/null)" "$@" 2>/dev/null
+}
+
+# Hand an existing site's env and compose files back to the real user when an
+# earlier sudo run left them root-owned. Without this `docker compose …` fails
+# for that user with "open …/ai-data-pipelines.env: permission denied" — even
+# though the setup wizard's own closing hint tells them to run exactly that.
+# Only runs under sudo, only touches files that are root-owned, and leaves
+# symlinks alone (the real file may be shared, e.g. on NFS).
+_dpd_hand_back_site_files() {
+    [[ ${EUID:-$(id -u)} -eq 0 && -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]] || return 0
+    local f env_file fixed=() cands=("$(_dpd_home)/ai-data-pipelines.env")
+    if _dp_compose_info; then
+        cands+=("$DP_COMPOSE_FILE")
+        env_file="$(_dp_compose_env_file "$DP_COMPOSE_FILE")"
+        [[ -n "$env_file" ]] && cands+=("$env_file")
+    fi
+    for f in "${cands[@]}"; do
+        [[ -f "$f" && ! -L "$f" && "$(stat -c %U "$f" 2>/dev/null)" == "root" ]] || continue
+        _dpd_chown_back "$f" && fixed+=("$f")
+    done
+    [[ ${#fixed[@]} -gt 0 ]] && \
+        log_fix "Handed back to ${SUDO_USER} (an earlier sudo run left them root-owned, which blocks 'docker compose' for that user): ${fixed[*]}"
+    return 0
 }
 
 # A small global profile (not per-site) remembering whether this host
@@ -2962,11 +2987,15 @@ docker_preflight() {
     [[ "$(dinspect '{{.State.Running}}')" != "true" ]] && \
         log_warn "Container '$DOCKER_CONTAINER' is not running — some checks will be limited"
 
+    # A site set up by an earlier sudo run may have root-owned env/compose files;
+    # under sudo, give them back to the real user (no-op otherwise).
+    _dpd_hand_back_site_files
+
     # Scans work without root (docker group), but every fix that rewrites the
     # Compose file fails if Doctor created it under sudo. Say so up front.
     if [[ ${EUID:-$(id -u)} -ne 0 ]] && _dp_compose_info && [[ ! -w "$DP_COMPOSE_FILE" ]]; then
         log_warn "Not running as root — $DP_COMPOSE_FILE isn't writable by $(id -un), so fixes that recreate the container will fail."
-        echo -e "  ${DIM}Scans still work. For fixes, re-run with:  sudo $0${NC}"
+        echo -e "  ${DIM}Scans still work. For fixes, re-run with:  sudo $0  (that run also hands the file back to you)${NC}"
     fi
 
     detect_host_ca
@@ -3586,7 +3615,7 @@ EOF
     if [[ -n "$compose_file" ]]; then
         local compose_backup
         compose_backup="${compose_file}.bak.$(date +%Y%m%d%H%M%S)"
-        if ! cp "$compose_file" "$compose_backup"; then
+        if ! cp -p "$compose_file" "$compose_backup"; then
             log_err "Could not back up ${compose_file} — aborting."
             return 1
         fi
@@ -4268,6 +4297,18 @@ _dp_real_path() {
     printf '%s' "$f"
 }
 
+# Replace $2 with the temp file $1, keeping $2's owner and mode. A bare `mv` of
+# a file Doctor just wrote leaves it owned by whoever ran Doctor — root under
+# sudo — so the first edit made through the menu would hand the user's own
+# env/compose file to root and lock them out of `docker compose`.
+# (chown/chmod --reference are GNU; elsewhere they fail quietly and it's a plain mv.)
+_dp_replace_file() {
+    local tmp="$1" dest="$2"
+    chown --reference="$dest" "$tmp" 2>/dev/null
+    chmod --reference="$dest" "$tmp" 2>/dev/null
+    mv "$tmp" "$dest"
+}
+
 # Add a "-p"-style port mapping to a Compose file's service, so a future
 # `docker compose up -d` doesn't silently drop ports added via this menu.
 # Creates the `ports:` key if it's missing; idempotent (skips if the exact
@@ -4283,7 +4324,7 @@ _dp_compose_add_port() {
         awk -v newmap="$newmap" '
             { print }
             /^[[:space:]]*ports:[[:space:]]*$/ { print "      - \"" newmap "\"" }
-        ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+        ' "$file" > "${file}.tmp" && _dp_replace_file "${file}.tmp" "$file"
     else
         awk -v newmap="$newmap" '
             { print }
@@ -4292,7 +4333,7 @@ _dp_compose_add_port() {
                 print "      - \"" newmap "\""
                 done=1
             }
-        ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+        ' "$file" > "${file}.tmp" && _dp_replace_file "${file}.tmp" "$file"
     fi
 }
 
@@ -4310,7 +4351,7 @@ _dp_compose_set_mem_limit() {
         awk -v mem="$mem" '
             /^[[:space:]]*mem_limit:/ { sub(/mem_limit:.*/, "mem_limit: " mem) }
             { print }
-        ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+        ' "$file" > "${file}.tmp" && _dp_replace_file "${file}.tmp" "$file"
     else
         awk -v mem="$mem" '
             { print }
@@ -4318,7 +4359,7 @@ _dp_compose_set_mem_limit() {
                 print "    mem_limit: " mem
                 done=1
             }
-        ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+        ' "$file" > "${file}.tmp" && _dp_replace_file "${file}.tmp" "$file"
     fi
 
     [[ -z "$memswap" ]] && return 0
@@ -4327,7 +4368,7 @@ _dp_compose_set_mem_limit() {
         awk -v ms="$memswap" '
             /^[[:space:]]*memswap_limit:/ { sub(/memswap_limit:.*/, "memswap_limit: " ms) }
             { print }
-        ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+        ' "$file" > "${file}.tmp" && _dp_replace_file "${file}.tmp" "$file"
     else
         awk -v ms="$memswap" '
             { print }
@@ -4335,7 +4376,7 @@ _dp_compose_set_mem_limit() {
                 print "    memswap_limit: " ms
                 done=1
             }
-        ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+        ' "$file" > "${file}.tmp" && _dp_replace_file "${file}.tmp" "$file"
     fi
 }
 
@@ -4363,7 +4404,7 @@ _dp_compose_add_mount() {
         awk -v spec="$spec" '
             { print }
             /^    volumes:[[:space:]]*$/ && !done { print "      - \"" spec "\""; done=1 }
-        ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+        ' "$file" > "${file}.tmp" && _dp_replace_file "${file}.tmp" "$file"
     else
         awk -v spec="$spec" '
             { print }
@@ -4372,7 +4413,7 @@ _dp_compose_add_mount() {
                 print "      - \"" spec "\""
                 done=1
             }
-        ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+        ' "$file" > "${file}.tmp" && _dp_replace_file "${file}.tmp" "$file"
     fi
 }
 
@@ -4392,14 +4433,14 @@ _dp_compose_set_env() {
         awk -v key="$key" -v value="$value" '
             $0 ~ ("^[[:space:]]*- \"" key "=") { print "      - \"" key "=" value "\""; next }
             { print }
-        ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+        ' "$file" > "${file}.tmp" && _dp_replace_file "${file}.tmp" "$file"
         return
     fi
     if grep -qE '^[[:space:]]*environment:[[:space:]]*$' "$file"; then
         awk -v key="$key" -v value="$value" '
             { print }
             /^[[:space:]]*environment:[[:space:]]*$/ && !done { print "      - \"" key "=" value "\""; done=1 }
-        ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+        ' "$file" > "${file}.tmp" && _dp_replace_file "${file}.tmp" "$file"
     else
         awk -v key="$key" -v value="$value" '
             { print }
@@ -4408,7 +4449,7 @@ _dp_compose_set_env() {
                 print "      - \"" key "=" value "\""
                 done=1
             }
-        ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+        ' "$file" > "${file}.tmp" && _dp_replace_file "${file}.tmp" "$file"
     fi
 }
 
@@ -4566,7 +4607,7 @@ docker_menu_source_ports() {
                 echo ""
                 echo -e "  ${YELLOW}This will update ${compose_file} and recreate ${DOCKER_CONTAINER} via Compose (~brief downtime).${NC}"
                 if ! confirm "Add -p ${newmap} to ${compose_file} and run 'docker compose up -d' now?"; then pause; return; fi
-                if ! cp "$compose_file" "${compose_file}.bak"; then
+                if ! cp -p "$compose_file" "${compose_file}.bak"; then
                     log_err "Could not back up ${compose_file} — aborting."; pause; return
                 fi
                 _dp_compose_add_port "$compose_file" "$newmap"

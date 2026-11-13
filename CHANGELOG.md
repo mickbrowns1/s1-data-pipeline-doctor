@@ -5,8 +5,11 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-Changes merged since the v1.6 version bump that haven't shipped under a new
-version string yet.
+## [1.7] - 2026-11-13
+
+Everything merged since v1.6 (2026-09-29): the container-recreate and
+site-ownership fixes, a saved rebuild recipe, port add/remove improvements,
+HEC and Syslog testers, and WEF/WEC integration.
 
 ### Changed
 

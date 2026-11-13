@@ -2556,6 +2556,7 @@ COMPOSE
         done
         if docker run -d \
             --name observo-standalone-site \
+            --restart unless-stopped \
             --env-file "$env_file" \
             --tmpfs /etc/secrets:uid=1000,gid=1000,mode=0700 \
             -v observo-data:/var/observo/data \

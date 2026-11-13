@@ -38,6 +38,22 @@ version string yet.
 
 ### Added
 
+- **Saved rebuild recipe.** A recreate reads the live container, so it was only
+  as good as the container: if the container or the host was lost there was
+  nothing to rebuild from, and with no running container the Doctor went
+  straight to "set up a new site". For a plain `docker run` site it now keeps
+  `~/.data-pipeline-doctor/<name>.recipe` — the full `docker run`, with no
+  secrets inline — next to the env file it already wrote (`<name>.env`, mode
+  600, directory mode 700). It is retaken whenever the container changes
+  (the previous five versions are kept as `<name>.recipe.<timestamp>`) and
+  shown in the menu header. When no container is running and a recipe
+  exists, the Doctor offers to rebuild from it exactly as it was, after
+  checking the env file, the image and any mounted host paths (a missing one
+  would otherwise be created empty and root-owned). Anything the recipe
+  couldn't capture is listed in it as `# NOT CAPTURED`. Compose-managed
+  sites are skipped — their compose file is the recipe. Note: the env file
+  (which holds the site secrets) is now written the first time the Doctor
+  sees a site, not only when it recreates it. (2026-11-13)
 - HEC tester (Tools 15) and HEC stream (Tools 16), mirroring the Syslog
   tester/stream pair (options 13–14) but for Splunk HEC-push sources: send
   a real `POST /services/collector/event` to a published HEC port, either
@@ -131,6 +147,29 @@ version string yet.
   exact same path as before (verified byte-identical output on Debian and
   Fedora). If `readlink -f` is unavailable the original path is used.
   (2026-11-03)
+
+- Recreating the container (editing source ports, adding mounts, restoring a
+  backup, make-ready) no longer drops `--tmpfs /etc/secrets`. Docker doesn't
+  list `--tmpfs` mounts under `.Mounts`, only under `HostConfig.Tmpfs`, so the
+  rebuilt `docker run` silently came back without the in-memory secrets
+  mount and the container's secrets landed in its writable layer on disk.
+  `_dp_build_run_cmd` now carries `HostConfig.Tmpfs` over. (2026-11-13)
+- The same recreate also silently reset every other setting it didn't know
+  about: network mode (a `--network host` site came back on the default
+  bridge with its listeners unreachable; user-defined networks lost their
+  aliases and fixed IP), `--dns`/`--dns-search`/`--add-host`, `--user`,
+  `--group-add`, `--ulimit`, `--cap-add/--cap-drop`, `--privileged`,
+  `--security-opt`, `--read-only`, `--sysctl`, `--device`, `--init`, log
+  options, pids/shm/cpu/memory-reservation/oom limits, explicit `--hostname`,
+  `--workdir`, stop signal/timeout, labels, and an entrypoint/command
+  override. All are now carried over, each only when it differs from the
+  image's own default, so an unmodified site's command is unchanged. What a
+  plain flag can't restore (extra networks beyond the first, a custom health
+  check, IPC/PID/UTS/userns modes, `--runtime`, `--volumes-from`, `--link`,
+  `-P`, an inline seccomp profile) is listed in a warning before the
+  recreate instead of being dropped silently. Compose's own labels are left
+  off a `docker run` recreate. (2026-11-13)
+
 - Make this site WEF-ready (Tools 17 → 2) no longer "succeeds" with a plain
   restart when the running container is stale. It used to decide nothing needed
   changing by comparing the Compose and env *files* before and after its own

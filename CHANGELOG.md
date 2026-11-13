@@ -120,6 +120,20 @@ version string yet.
 
 ### Fixed
 
+- A site set up (or later edited) through Doctor run under `sudo` no longer
+  ends up with root-owned `ai-data-pipelines.env` and
+  `docker-compose-observo.yml`. Those files were written as root, so the
+  login user got `open …/ai-data-pipelines.env: permission denied` from the
+  very `docker compose … [up -d|down|logs|restart]` command New Site Setup
+  prints as its closing hint, and had to use `sudo` for everything. New Site
+  Setup now hands both files to the invoking user; the compose helpers (open
+  a port, memory limit, add a mount, set an env value) keep the file's owner
+  and mode when they rewrite it (a bare `mv` of the temp file used to give a
+  user-owned 640 file to root with mode 644); and the compose backups keep
+  their owner. A site already set up that way is repaired the next time
+  Doctor runs under `sudo`: root-owned env/compose files (symlinks are left
+  alone — the real file may be shared) are handed back and it says so.
+  (2026-11-13)
 - Doctor no longer replaces a symlinked env or compose file with a local copy
   when it edits it. The compose helpers (open a port, set the memory limit, add
   a mount, set an environment value) write a temp file and `mv` it over the

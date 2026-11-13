@@ -12,6 +12,7 @@ HOST_CA_PATH=""
 DETECTED_ISSUES=()
 DP_EXTRA_MOUNTS=()   # set by a caller before _dp_build_run_cmd to add -v mounts; consumed (cleared) by it
 DP_EXTRA_ENV=()       # set by a caller before _dp_build_run_cmd to add KEY=value env lines; consumed (cleared) by it
+DP_DROP_PORTS=()      # set by a caller before _dp_build_run_cmd: host:container/proto mappings to leave out; consumed (cleared) by it
 WEF_MODE=false        # does this host manage WEF/WEC-forwarding sites? asked once at startup, saved to a profile file
 DP_WEF_FIPS_ON=false  # set by _dp_wef_check
 DP_NEW_SITE_WEF=false # set when docker_setup_new_site built this site WEF-ready this run
@@ -2453,18 +2454,9 @@ docker_setup_new_site() {
     if confirm "Add${wef_port:+ more} source listener ports now?"; then
         while true; do
             echo
-            echo "    Port mapping presets:"
-            echo "      1) Syslog TCP (1514:1514)"
-            echo "      2) Syslog TLS (6514:6514)"
-            echo "      3) Syslog UDP (514:514/udp)"
-            echo "      4) HEC push (8088:8088)"
-            echo "      5) Kafka (9092:9092)"
-            echo "      6) Custom"
-            echo "      0) Skip ports"
-            echo
-            local port_choice
-            read -rp "    Choose [0-6]: " port_choice || _dpd_eof_exit
-            [[ "$port_choice" == "0" ]] && break
+            local preset port_spec clash
+            preset=$(_dp_pick_port_preset "Done — no more ports")
+            [[ -z "$preset" ]] && break
 
             # Host and container port match — the dataplane binds directly to
             # whatever address the console source is configured with, no
@@ -2474,19 +2466,19 @@ docker_setup_new_site() {
             # host:514 to a *different* container port left nothing
             # listening on the published side, so UDP traffic silently
             # vanished with no error anywhere. 2026-11-02).
-            local port_spec
-            case "$port_choice" in
-                1) port_spec="1514:1514" ;;
-                2) port_spec="6514:6514" ;;  # TLS handled by container config
-                3) port_spec="514:514/udp" ;;
-                4) port_spec="8088:8088" ;;
-                5) port_spec="9092:9092" ;;
-                6)
-                    read -rp "    Enter port mapping (host:container[/proto]): " port_spec || _dpd_eof_exit
-                    [[ -z "$port_spec" ]] && continue
-                    ;;
-                *) log_warn "Invalid choice"; continue ;;
-            esac
+            # The preset only suggests a port — the prompt lets you change it
+            # (a site that wants HEC on 8003, not 8088, shouldn't have to pick
+            # "Custom" and retype the protocol).
+            port_spec=$(_dp_ask_port_mapping "${preset%%|*}" "${preset##*|}") || continue
+            [[ -z "$port_spec" ]] && continue
+            if clash=$(_dp_port_clash "$port_spec" "${port_specs[@]+"${port_specs[@]}"}"); then
+                if [[ "$clash" == "$port_spec" ]]; then
+                    log_warn "Already added: $port_spec — skipped."
+                else
+                    log_warn "Host port ${port_spec%%:*}/${port_spec##*/} is already used by ${clash} — pick a different host port."
+                fi
+                continue
+            fi
 
             port_specs+=("$port_spec")
             log_ok "Added: $port_spec"
@@ -4224,7 +4216,7 @@ _dp_port_role() {
         6514/tcp) echo "Syslog TLS" ;;
         10514/udp|514/udp) echo "Syslog UDP" ;;
         514/tcp|1514/tcp) echo "Syslog TCP" ;;
-        8088/tcp) echo "HEC push" ;;
+        8088/tcp|800[1-5]/tcp) echo "HEC push" ;;
         9092/tcp) echo "Kafka" ;;
         *) echo "—" ;;
     esac
@@ -4237,6 +4229,86 @@ _dp_firewall_hints() {
     echo "    ufw:       sudo ufw allow ${port}/${proto}"
     echo "    firewalld: sudo firewall-cmd --add-port=${port}/${proto} --permanent && sudo firewall-cmd --reload"
     echo "    iptables:  sudo iptables -A INPUT -p ${proto} --dport ${port} -j ACCEPT"
+}
+
+# ------------------------------------------------------------
+#  Choosing a port — shared by New Site Setup and Source ports → Add
+# ------------------------------------------------------------
+# Pick the kind of source. Prints "proto|default-port" ("|" alone = custom) and
+# nothing for the exit entry. The default is only a suggestion: the next prompt,
+# _dp_ask_port_mapping, always lets you change it. $1 = label of the exit entry.
+_dp_pick_port_preset() {
+    local back="$1" choice hec hec_ports=(8088 8001 8002 8003 8004 8005)
+    choice=$(pick_one "Add a port for which source type?" \
+        "Syslog TCP (1514)" "Syslog TLS (6514)" "Syslog UDP (514)" "HEC push (8088, 8001–8005)" \
+        "Kafka (9092)" "Custom" "$back")
+    case "$choice" in
+        1) echo "tcp|1514" ;;
+        2) echo "tcp|6514" ;;
+        3) echo "udp|514" ;;
+        4) hec=$(pick_one "Which HEC port?" "${hec_ports[@]}")
+           [[ "$hec" =~ ^[1-6]$ ]] && echo "tcp|${hec_ports[$((hec - 1))]}" ;;
+        5) echo "tcp|9092" ;;
+        6) echo "|" ;;
+    esac
+    return 0
+}
+
+# Ask for one mapping, docker-style, with an editable default. Accepts HOST or
+# HOST:CONTAINER, optionally with /tcp or /udp; a bare HOST maps to the same
+# container port. Prints "host:container/proto" on stdout; if the input is
+# invalid, says why on stderr and returns 1. $1 = protocol ("" = ask),
+# $2 = suggested port ("" = none).
+_dp_ask_port_mapping() {
+    local proto="$1" sugg="$2" input hport cport
+    if [[ -z "$proto" ]]; then
+        read -rp "  Protocol [tcp/udp] (default tcp): " proto || _dpd_eof_exit; proto="${proto:-tcp}"
+    fi
+    echo -e "  ${DIM}Enter the mapping as host[:container] — e.g. ${NC}10001${DIM} or ${NC}10001:10001${DIM} (container port" >&2
+    echo -e "  must match the source's listen port; defaults to the host port).${NC}" >&2
+    read -rp "  Port mapping${sugg:+ (default $sugg — or type a different port)}: " input || _dpd_eof_exit
+    input="${input:-$sugg}"
+    input="${input// /}"                                  # tolerate stray spaces
+    if [[ "$input" == */* ]]; then proto="${input##*/}"; input="${input%%/*}"; fi   # optional /proto override
+    if [[ "$input" == *:* ]]; then hport="${input%%:*}"; cport="${input##*:}"; else hport="$input"; cport="$input"; fi
+    if ! [[ "$hport" =~ ^[0-9]+$ && "$cport" =~ ^[0-9]+$ && "$hport" -ge 1 && "$hport" -le 65535 && "$cport" -ge 1 && "$cport" -le 65535 ]]; then
+        log_err "Invalid mapping '$input' — use host or host:container with ports 1-65535 (e.g. 10001 or 10001:10001)" >&2
+        return 1
+    fi
+    if ! [[ "$proto" =~ ^(tcp|udp)$ ]]; then
+        log_err "Invalid protocol '$proto' — use tcp or udp" >&2
+        return 1
+    fi
+    printf '%s' "${hport}:${cport}/${proto}"
+}
+
+# Does mapping $1 ("host:container/proto") want a host port+protocol that one of
+# the mappings in the remaining args already uses? Prints that mapping and
+# returns 0 if so. The same mapping twice counts (it's the common slip).
+_dp_port_clash() {
+    local new="$1" other nkey okey; shift
+    nkey="${new%%:*}/${new##*/}"
+    for other in "$@"; do
+        [[ -z "$other" ]] && continue
+        okey="${other%%:*}/${other##*/}"
+        [[ "$okey" == "$nkey" ]] && { printf '%s' "$other"; return 0; }
+    done
+    return 1
+}
+
+# Is anything listening on, or configured for, container port $1/$2 right now?
+# (Used before removing a published port; same evidence _dp_listener_status reads.)
+_dp_listener_active() {
+    local cport="$1" proto="$2" hexport listening cfg
+    hexport=$(printf '%04X' "$cport" 2>/dev/null)
+    if [[ -n "$hexport" ]]; then
+        listening=$(dexec sh -c "cat /proc/net/${proto} /proc/net/${proto}6 2>/dev/null" 2>/dev/null \
+            | awk -v port="$hexport" -v proto="$proto" 'NR>1 { split($2,a,":");
+                  if (toupper(a[2])==port) { if (proto=="tcp" && $4=="0A"){print "y";exit} if (proto=="udp"){print "y";exit} } }')
+    fi
+    cfg=$(dexec sh -c "cat /etc/dataplane/config.yaml /etc/collector/config.yaml 2>/dev/null" 2>/dev/null \
+        | grep -E '^[[:space:]]*address:' | grep -cE ":${cport}([^0-9]|\$)" 2>/dev/null)
+    [[ -n "$listening" || "${cfg:-0}" -gt 0 ]]
 }
 
 # Informational only: report whether the container is already set up to receive
@@ -4335,6 +4407,44 @@ _dp_compose_add_port() {
             }
         ' "$file" > "${file}.tmp" && _dp_replace_file "${file}.tmp" "$file"
     fi
+}
+
+# Remove a published port from a Compose file's `ports:` list — every entry that
+# maps host port H to container port C over the same protocol, however it was
+# written ("H:C", "H:C/udp", "127.0.0.1:H:C"), so a duplicated entry goes too.
+# Drops the `ports:` key if that empties it. $2 = "host:container/proto".
+# Returns 1 (file untouched) if nothing matched. Same layout assumptions as
+# _dp_compose_add_port.
+_dp_compose_remove_port() {
+    local file="$1" target="$2"
+    file=$(_dp_real_path "$file")
+    awk -v target="$target" '
+        function norm(x,   proto, n, a, hp, cp) {
+            sub(/^[ \t]*-[ \t]*/, "", x); gsub(/["\047]/, "", x); sub(/[ \t]+$/, "", x)
+            proto = "tcp"
+            if (index(x, "/")) { proto = substr(x, index(x, "/") + 1); x = substr(x, 1, index(x, "/") - 1) }
+            n = split(x, a, ":")
+            if (n == 3)      { hp = a[2]; cp = a[3] }
+            else if (n == 2) { hp = a[1]; cp = a[2] }
+            else             { hp = a[1]; cp = a[1] }
+            return hp ":" cp "/" proto
+        }
+        BEGIN { inports = 0; held = ""; kept = 0 }
+        {
+            if (inports) {
+                if ($0 ~ /^[ \t]+-[ \t]/) {
+                    if (norm($0) == target) next
+                    if (held != "") { print held; held = "" }
+                    print; kept++; next
+                }
+                inports = 0; held = ""      # list ended; an emptied `ports:` header is dropped
+            }
+            if ($0 ~ /^[ \t]*ports:[ \t]*$/) { inports = 1; held = $0; kept = 0; next }
+            print
+        }
+    ' "$file" > "${file}.tmp" || { rm -f "${file}.tmp"; return 1; }
+    if cmp -s "$file" "${file}.tmp"; then rm -f "${file}.tmp"; return 1; fi
+    _dp_replace_file "${file}.tmp" "$file"
 }
 
 # Set (or add) a Compose file's mem_limit / memswap_limit keys, mirroring a
@@ -4493,8 +4603,11 @@ _dp_build_run_cmd() {
     local hip hport cport
     while IFS='|' read -r hip hport cport; do
         [[ -z "$cport" ]] && continue
+        # a port the caller is removing (host:container/proto)
+        [[ " ${DP_DROP_PORTS[*]-} " == *" ${hport}:${cport} "* ]] && continue
         if [[ -n "$hip" ]]; then DP_RUN_CMD+=(-p "${hip}:${hport}:${cport}"); else DP_RUN_CMD+=(-p "${hport}:${cport}"); fi
     done < <(dinspect '{{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostIp}}|{{.HostPort}}|{{$p}}{{println}}{{end}}{{end}}')
+    DP_DROP_PORTS=()   # consume so a removal never leaks into an unrelated later call
 
     local np
     for np in "$@"; do DP_RUN_CMD+=(-p "$np"); done
@@ -4506,13 +4619,12 @@ _dp_build_run_cmd() {
     DP_RUN_CMD+=("$image")
 }
 
-docker_menu_source_ports() {
-    banner
-    echo -e "  ${BOLD}Source Ports — $DOCKER_CONTAINER${NC}"
-    echo ""
-
-    echo -e "  ${BOLD}Currently published:${NC}"
+# The ports this container currently publishes, with each one's role. Shown at
+# the top of Source ports (so you see what's defined before choosing) and again
+# at the top of Add.
+_dp_print_published_ports() {
     local any=false hip hport cport role
+    echo -e "  ${BOLD}Currently published:${NC}"
     while IFS='|' read -r hip hport cport; do
         [[ -z "$cport" ]] && continue
         any=true
@@ -4521,41 +4633,167 @@ docker_menu_source_ports() {
     done < <(dinspect '{{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostIp}}|{{.HostPort}}|{{$p}}{{println}}{{end}}{{end}}')
     $any || echo -e "    ${DIM}(none published)${NC}"
     echo ""
+}
 
-    # Choose a preset (prefills proto + suggested port) or custom.
-    local choice
-    choice=$(pick_one "Add a port for which source type?" \
-        "Syslog TCP" "Syslog TLS" "Syslog UDP" "HEC push" "Kafka" "Custom" "Back")
-    local proto sugg
-    case "$choice" in
-        1) proto=tcp; sugg=1514 ;;
-        2) proto=tcp; sugg=6514 ;;
-        3) proto=udp; sugg=514 ;;
-        4) proto=tcp; sugg=8088 ;;
-        5) proto=tcp; sugg=9092 ;;
-        6) proto=""; sugg="" ;;
+docker_menu_source_ports() {
+    banner
+    echo -e "  ${BOLD}Source Ports — $DOCKER_CONTAINER${NC}"
+    echo ""
+    _dp_print_published_ports
+    local a
+    a=$(pick_one "What do you want to do?" "Add a port" "Remove a port" "Back")
+    case "$a" in
+        1) _dp_source_ports_add ;;
+        2) _dp_source_ports_remove ;;
         *) return ;;
     esac
-    if [[ -z "$proto" ]]; then
-        read -rp "  Protocol [tcp/udp] (default tcp): " proto || _dpd_eof_exit; proto="${proto:-tcp}"
-    fi
-    # One prompt, docker-style. Accepts:  HOST  |  HOST:CONTAINER  |  with optional /tcp|/udp
-    # If only HOST is given, the container port defaults to the same number.
-    local input hport cport
-    echo -e "  ${DIM}Enter the mapping as host[:container] — e.g. ${NC}10001${DIM} or ${NC}10001:10001${DIM} (container port"
-    echo -e "  must match the source's listen port; defaults to the host port).${NC}"
-    read -rp "  Port mapping${sugg:+ (default $sugg)}: " input || _dpd_eof_exit; input="${input:-$sugg}"
-    input="${input// /}"                                  # tolerate stray spaces
-    if [[ "$input" == */* ]]; then proto="${input##*/}"; input="${input%%/*}"; fi   # optional /proto override
-    if [[ "$input" == *:* ]]; then hport="${input%%:*}"; cport="${input##*:}"; else hport="$input"; cport="$input"; fi
-    if ! [[ "$hport" =~ ^[0-9]+$ && "$cport" =~ ^[0-9]+$ ]]; then
-        log_err "Invalid mapping '$input' — use host or host:container (e.g. 10001 or 10001:10001)"; pause; return
-    fi
-    if ! [[ "$proto" =~ ^(tcp|udp)$ ]]; then
-        log_err "Invalid protocol '$proto' — use tcp or udp"; pause; return
+}
+
+# Stop publishing a port. Docker can't change a running container's ports, so
+# this recreates it (Compose: edits the file, then `compose up -d`; plain
+# `docker run`: rebuilds the command without that -p). It only unpublishes the
+# port on this host — the source in the console is not touched.
+_dp_source_ports_remove() {
+    banner
+    echo -e "  ${BOLD}Remove a published port — $DOCKER_CONTAINER${NC}"
+    echo ""
+    local maps=() labels=() hip hport cport
+    while IFS='|' read -r hip hport cport; do
+        [[ -z "$cport" ]] && continue
+        maps+=("${hport}:${cport}")
+        labels+=("host ${hport} → container ${cport}   $(_dp_port_role "$cport" "$hport")")
+    done < <(dinspect '{{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostIp}}|{{.HostPort}}|{{$p}}{{println}}{{end}}{{end}}')
+    if [[ ${#maps[@]} -eq 0 ]]; then
+        log_info "No ports are published on this container."; pause; return
     fi
 
-    local newmap="${hport}:${cport}/${proto}"
+    local ch; ch=$(pick_one "Which port should stop being published?" "${labels[@]}" "Back")
+    [[ "$ch" =~ ^[0-9]+$ && "$ch" -ge 1 && "$ch" -le ${#maps[@]} ]] || return
+    local target="${maps[$((ch-1))]}"                       # host:container/proto
+    local proto cnum
+    hport="${target%%:*}"; cport="${target#*:}"; proto="${cport##*/}"; cnum="${cport%%/*}"
+
+    echo ""
+    log_info "Removing: host ${hport} → container ${cport}"
+    echo -e "  ${DIM}This only stops publishing the port on this host. It does not remove or change the source in the console.${NC}"
+    if _dp_listener_active "$cnum" "$proto"; then
+        echo ""
+        log_warn "A source is still listening on container port ${cnum}/${proto} — once the port is unpublished, nothing can send to it and its data stops."
+        confirm "Remove it anyway?" || { pause; return; }
+    else
+        log_info "Nothing is listening on container port ${cnum}/${proto}, so no data flows through it today."
+    fi
+    echo ""
+    echo -e "  ${YELLOW}Docker can't remove a port from a running container — it must be recreated.${NC}"
+    echo ""
+
+    local compose_file=""
+    if _dp_compose_info; then
+        compose_file="$DP_COMPOSE_FILE"
+        log_info "This site is managed by Docker Compose (${compose_file})."
+        echo ""
+    fi
+
+    local act
+    act=$(pick_one "How do you want to proceed?" \
+        "Show the recreate command (I'll run it myself)" \
+        "Recreate the container now (confirm first)" \
+        "Back")
+    case "$act" in
+        1)
+            echo ""
+            echo -e "  ${BOLD}Recreate command:${NC}"
+            echo ""
+            if [[ -n "$compose_file" ]]; then
+                echo "    cp ${compose_file} ${compose_file}.bak   # backup first"
+                echo "    # then delete this line from the service's 'ports:' list:"
+                echo "    #   - \"${target}\"   (the entry for host port ${hport}; the format may differ slightly)"
+                echo "    docker compose -f ${compose_file} up -d"
+                echo ""
+                echo -e "  ${DIM}Rollback if needed: cp ${compose_file}.bak ${compose_file} && docker compose -f ${compose_file} up -d${NC}"
+            else
+                DP_DROP_PORTS=("$target")
+                _dp_build_run_cmd
+                echo -e "  ${DIM}Env written to ${DP_ENV_FILE} (chmod 600 — contains secrets).${NC}"
+                echo "    docker stop $DOCKER_CONTAINER && docker rename $DOCKER_CONTAINER ${DOCKER_CONTAINER}_old && \\"
+                printf '    '; printf '%q ' "${DP_RUN_CMD[@]}"; echo
+                echo ""
+                echo -e "  ${DIM}Rollback if needed: docker rm -f $DOCKER_CONTAINER; docker rename ${DOCKER_CONTAINER}_old $DOCKER_CONTAINER; docker start $DOCKER_CONTAINER${NC}"
+            fi
+            pause ;;
+        2)
+            if [[ -n "$compose_file" ]]; then
+                echo -e "  ${YELLOW}This will update ${compose_file} and recreate ${DOCKER_CONTAINER} via Compose (~brief downtime).${NC}"
+                if ! confirm "Remove ${hport}:${cport} from ${compose_file} and run 'docker compose up -d' now?"; then pause; return; fi
+                if ! cp -p "$compose_file" "${compose_file}.bak"; then
+                    log_err "Could not back up ${compose_file} — aborting."; pause; return
+                fi
+                if ! _dp_compose_remove_port "$compose_file" "$target"; then
+                    log_err "Didn't find ${target} in ${compose_file}, so nothing was changed."
+                    echo -e "  ${DIM}(The port may have been published some other way, e.g. by hand with docker run.)${NC}"
+                    rm -f "${compose_file}.bak"; pause; return
+                fi
+                if docker compose -f "$compose_file" up -d >/dev/null 2>&1; then
+                    log_fix "Removed ${hport}:${cport} from ${compose_file} and recreated $DOCKER_CONTAINER."
+                    echo -e "  ${DIM}Previous file saved as ${compose_file}.bak${NC}"
+                else
+                    log_err "docker compose up failed — restoring the previous ${compose_file}"
+                    cp "${compose_file}.bak" "$compose_file"
+                    docker compose -f "$compose_file" up -d >/dev/null 2>&1
+                fi
+            else
+                DP_DROP_PORTS=("$target")
+                _dp_build_run_cmd
+                echo ""
+                echo -e "  ${YELLOW}This will stop and recreate ${DOCKER_CONTAINER} (~brief downtime).${NC}"
+                echo -e "  ${DIM}The current container is renamed (not deleted) so you can roll back.${NC}"
+                if ! confirm "Recreate $DOCKER_CONTAINER now without ${hport}:${cport}?"; then pause; return; fi
+                local backup; backup="${DOCKER_CONTAINER}_pre$(date +%s)"
+                if ! docker stop "$DOCKER_CONTAINER" >/dev/null 2>&1; then log_err "Failed to stop container"; pause; return; fi
+                if ! docker rename "$DOCKER_CONTAINER" "$backup" >/dev/null 2>&1; then log_err "Failed to rename; container is stopped — start it again with: docker start $DOCKER_CONTAINER"; pause; return; fi
+                if "${DP_RUN_CMD[@]}" >/dev/null 2>&1; then
+                    log_fix "Recreated $DOCKER_CONTAINER without ${hport}:${cport}. Backup: $backup"
+                    echo -e "  ${DIM}Verify, then remove the backup: docker rm $backup${NC}"
+                else
+                    log_err "Recreate failed — rolling back to the previous container"
+                    docker rm -f "$DOCKER_CONTAINER" >/dev/null 2>&1
+                    docker rename "$backup" "$DOCKER_CONTAINER" >/dev/null 2>&1
+                    docker start "$DOCKER_CONTAINER" >/dev/null 2>&1 && log_info "Rolled back; original container is running again."
+                fi
+            fi
+            pause ;;
+        *) return ;;
+    esac
+}
+
+_dp_source_ports_add() {
+    banner
+    echo -e "  ${BOLD}Source Ports — $DOCKER_CONTAINER${NC}"
+    echo ""
+
+    _dp_print_published_ports
+
+    # Choose a preset (prefills proto + suggested port) or custom; the default is editable.
+    local preset newmap proto hport cport clash
+    preset=$(_dp_pick_port_preset "Back")
+    [[ -z "$preset" ]] && return
+    newmap=$(_dp_ask_port_mapping "${preset%%|*}" "${preset##*|}") || { pause; return; }
+    [[ -z "$newmap" ]] && return
+    proto="${newmap##*/}"; hport="${newmap%%:*}"; cport="${newmap#*:}"; cport="${cport%%/*}"
+
+    # Already published by this container (the same mapping, or the same host port)?
+    local published=() hp2 cp2
+    while IFS='|' read -r _ hp2 cp2; do
+        [[ -n "$cp2" ]] && published+=("${hp2}:${cp2}")
+    done < <(dinspect '{{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostIp}}|{{.HostPort}}|{{$p}}{{println}}{{end}}{{end}}')
+    if clash=$(_dp_port_clash "$newmap" "${published[@]+"${published[@]}"}"); then
+        if [[ "$clash" == "$newmap" ]]; then
+            log_warn "${newmap} is already published — nothing to do."
+        else
+            log_err "Host port ${hport}/${proto} is already published as ${clash}. Remove that mapping first, or pick a different host port."
+        fi
+        pause; return
+    fi
     echo ""
     log_info "New mapping: -p ${newmap}"
     _dp_listener_status "$cport" "$proto"

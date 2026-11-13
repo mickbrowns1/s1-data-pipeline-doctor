@@ -38,6 +38,24 @@ version string yet.
 
 ### Added
 
+- **Remove a published port** (menu 12 → Remove a port). Source ports could add a
+  published port but never take one away, so a mistyped mapping meant editing the
+  compose file by hand. It lists the published ports with their roles, warns
+  first if a source is still listening on the one you picked (its data would
+  stop), and recreates the container without it — Compose sites by editing the
+  file (every entry for that host port, so a duplicate goes too; the `ports:` key
+  is dropped if it empties; backed up, with rollback), plain `docker run` sites by
+  rebuilding the command without that `-p`, with the usual renamed backup. It only
+  unpublishes the port on this host; the source in the console is not touched.
+  (2026-11-13)
+- **HEC on 8001–8005.** "HEC push" in New Site Setup and Source ports → Add now
+  asks which port — 8088 or 8001–8005 (the HEC tester examples already used
+  8001/8002) — and, like every preset, the prompt after it lets you type any
+  other port. Those ports are labelled "HEC push" in the published-ports list.
+  (2026-11-13)
+- Source ports (menu 12) opens with the ports the container already publishes,
+  with each one's role, and then asks Add / Remove / Back, so you see what's
+  defined before choosing. (2026-11-13)
 - HEC tester (Tools 15) and HEC stream (Tools 16), mirroring the Syslog
   tester/stream pair (options 13–14) but for Splunk HEC-push sources: send
   a real `POST /services/collector/event` to a published HEC port, either
@@ -120,6 +138,15 @@ version string yet.
 
 ### Fixed
 
+- New Site Setup's port step gave no way to change a preset's port: picking
+  "HEC push" always meant `8088:8088`, so a site that wanted HEC elsewhere had to
+  pick "Custom" and retype everything — and picking the same preset twice by
+  mistake wrote the mapping into the compose file twice. Setup now uses the same
+  prompt as Source ports → Add: the preset only suggests a port ("default 8088 —
+  or type a different port") and accepts `HOST`, `HOST:CONTAINER` or `/udp`.
+  Both flows now refuse a mapping that was already added, or that reuses a host
+  port/protocol already taken (Source ports checks what the container already
+  publishes), and validate ports as 1–65535. (2026-11-13)
 - A site set up (or later edited) through Doctor run under `sudo` no longer
   ends up with root-owned `ai-data-pipelines.env` and
   `docker-compose-observo.yml`. Those files were written as root, so the

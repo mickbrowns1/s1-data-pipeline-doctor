@@ -266,7 +266,7 @@ splash() {
     echo " ██║     ██║██║     ███████╗███████╗██║██║ ╚████║███████╗███████║"
     echo " ╚═╝     ╚═╝╚═╝     ╚══════╝╚══════╝╚═╝╚═╝  ╚═══╝╚══════╝╚══════╝"
     echo -e "${NC}${BOLD}${CYAN}"
-    echo " ══════════════════════════════════════════   ♥  Doctor v1.6"
+    echo " ══════════════════════════════════════════   ♥  Doctor v1.7"
     echo -e "${NC}${DIM}   Site diagnostics & remediation  ·  K8s + Docker  ·  SentinelOne${NC}"
     echo ""
     read -rp "  Press Enter to begin..." _ || _dpd_eof_exit
@@ -276,7 +276,7 @@ splash() {
 banner() {
     clear
     echo ""
-    echo -e "  ${BOLD}${PURPLE}S1 DATA PIPELINES${NC} ${DIM}·${NC} ${BOLD}${CYAN}Doctor${NC} ${DIM}v1.6${NC}    ${CYAN}♥${NC}"
+    echo -e "  ${BOLD}${PURPLE}S1 DATA PIPELINES${NC} ${DIM}·${NC} ${BOLD}${CYAN}Doctor${NC} ${DIM}v1.7${NC}    ${CYAN}♥${NC}"
     echo -e "  ${DIM}K8s + Docker site diagnostics · Built by SentinelOne Architecture Team${NC}"
     hr
     echo ""
@@ -2556,6 +2556,7 @@ COMPOSE
         done
         if docker run -d \
             --name observo-standalone-site \
+            --restart unless-stopped \
             --env-file "$env_file" \
             --tmpfs /etc/secrets:uid=1000,gid=1000,mode=0700 \
             -v observo-data:/var/observo/data \

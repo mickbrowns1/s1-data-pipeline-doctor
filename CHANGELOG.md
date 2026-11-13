@@ -5,8 +5,11 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-Changes merged since the v1.6 version bump that haven't shipped under a new
-version string yet.
+## [1.7] - 2026-11-13
+
+Everything merged since v1.6 (2026-09-29): the container-recreate and
+site-ownership fixes, a saved rebuild recipe, port add/remove improvements,
+HEC and Syslog testers, and WEF/WEC integration.
 
 ### Changed
 
@@ -154,6 +157,13 @@ version string yet.
 
 ### Fixed
 
+- A site created through New Site Setup's plain `docker run` path (the "No" answer
+  to Docker Compose) had no restart policy, so it stayed down after a host reboot
+  or a Docker daemon restart, while the Compose path already generated
+  `restart: unless-stopped`. The `docker run` now passes `--restart unless-stopped`,
+  so both ways of creating a site give the same container. (A recreate has always
+  carried the live container's restart policy over; this fixes where it starts.)
+  (2026-11-13)
 - New Site Setup's port step gave no way to change a preset's port: picking
   "HEC push" always meant `8088:8088`, so a site that wanted HEC elsewhere had to
   pick "Custom" and retype everything — and picking the same preset twice by

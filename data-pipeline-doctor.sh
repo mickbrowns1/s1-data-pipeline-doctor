@@ -2964,7 +2964,13 @@ docker_preflight() {
         while IFS= read -r m; do [[ -n "$m" ]] && arr+=("$m"); done <<< "$matches"
 
         if [[ ${#arr[@]} -eq 0 ]]; then
-            docker_setup_new_site || exit 1
+            local rrc=1
+            _dp_offer_recipe_rebuild; rrc=$?
+            case "$rrc" in
+                0) ;;
+                2) exit 1 ;;
+                *) docker_setup_new_site || exit 1 ;;
+            esac
         elif [[ ${#arr[@]} -eq 1 ]]; then
             DOCKER_CONTAINER="${arr[0]}"
         else
@@ -4563,6 +4569,163 @@ _dp_compose_set_env() {
     fi
 }
 
+# ------------------------------------------------------------
+#  Carrying container settings across a recreate
+# ------------------------------------------------------------
+# Docker can't change most settings on a live container, so a recreate has to
+# restate every one of them or it silently reverts to the default (host
+# networking becomes bridge, custom DNS disappears, ulimits reset...). Each
+# setting is emitted only when it differs from what the image/daemon would
+# give anyway, so a plain site's command is unchanged. Anything that can't be
+# expressed as a plain `docker run` flag is collected in DP_RUN_WARN.
+DP_RUN_TAIL=()    # args that go after the image (a changed command/entrypoint tail)
+DP_RUN_WARN=()    # settings a recreate can't carry over; shown to the user, kept in the saved recipe
+DP_QUIET=0        # 1 = build silently (used when taking a recipe snapshot)
+
+_dp_iinspect() { docker image inspect --format "$2" "$1" 2>/dev/null; }   # $1=image $2=template
+
+# One flag per non-empty line of the template's output.
+_dp_carry_list() {
+    local flag="$1" line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && DP_RUN_CMD+=("$flag" "$line")
+    done < <(dinspect "$2")
+}
+
+# Numeric flag, emitted only when the value is a positive integer.
+_dp_carry_num() {
+    local v; v=$(dinspect "$2")
+    [[ "$v" =~ ^[0-9]+$ && "$v" -gt 0 ]] && DP_RUN_CMD+=("$1" "$v")
+    return 0
+}
+
+_dp_carry_container_settings() {
+    local image="$1" netmode cid line v ci ii
+
+    # --- Networking ------------------------------------------------------
+    netmode=$(dinspect '{{.HostConfig.NetworkMode}}')
+    cid=$(dinspect '{{printf "%.12s" .Id}}')
+    if [[ -n "$netmode" && "$netmode" != "default" && "$netmode" != "bridge" ]]; then
+        DP_RUN_CMD+=(--network "$netmode")
+        if [[ "$netmode" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ && "$netmode" != "host" && "$netmode" != "none" ]]; then
+            while IFS= read -r line; do
+                [[ -n "$line" && "$line" != "$cid" && "$line" != "$DOCKER_CONTAINER" ]] && DP_RUN_CMD+=(--network-alias "$line")
+            done < <(dinspect "{{range (index .NetworkSettings.Networks \"$netmode\").Aliases}}{{println .}}{{end}}")
+            line=$(dinspect "{{with (index .NetworkSettings.Networks \"$netmode\").IPAMConfig}}{{.IPv4Address}}{{end}}")
+            [[ -n "$line" ]] && DP_RUN_CMD+=(--ip "$line")
+        fi
+    fi
+    v=$(dinspect '{{len .NetworkSettings.Networks}}')
+    [[ "$v" =~ ^[0-9]+$ && "$v" -gt 1 ]] && \
+        DP_RUN_WARN+=("attached to $v networks — only '$netmode' is restored; re-attach the others with: docker network connect <net> $DOCKER_CONTAINER")
+    _dp_carry_list --dns         '{{range .HostConfig.Dns}}{{println .}}{{end}}'
+    _dp_carry_list --dns-search  '{{range .HostConfig.DnsSearch}}{{println .}}{{end}}'
+    _dp_carry_list --dns-option  '{{range .HostConfig.DnsOptions}}{{println .}}{{end}}'
+    _dp_carry_list --add-host    '{{range .HostConfig.ExtraHosts}}{{println .}}{{end}}'
+    # An explicit --hostname only; the default is the container id. A host/container
+    # network mode inherits the hostname, and Docker rejects --hostname there.
+    v=$(dinspect '{{.Config.Hostname}}')
+    if [[ -n "$v" && "$v" != "$cid" && "$netmode" != "host" && "$netmode" != container:* ]]; then
+        DP_RUN_CMD+=(--hostname "$v")
+    fi
+    v=$(dinspect '{{.Config.Domainname}}')
+    [[ -n "$v" && "$netmode" != "host" && "$netmode" != container:* ]] && DP_RUN_CMD+=(--domainname "$v")
+
+    # --- Identity / process ----------------------------------------------
+    ci=$(dinspect '{{.Config.User}}');       ii=$(_dp_iinspect "$image" '{{.Config.User}}')
+    [[ -n "$ci" && "$ci" != "$ii" ]] && DP_RUN_CMD+=(--user "$ci")
+    ci=$(dinspect '{{.Config.WorkingDir}}'); ii=$(_dp_iinspect "$image" '{{.Config.WorkingDir}}')
+    [[ -n "$ci" && "$ci" != "$ii" ]] && DP_RUN_CMD+=(--workdir "$ci")
+    ci=$(dinspect '{{.Config.StopSignal}}'); ii=$(_dp_iinspect "$image" '{{.Config.StopSignal}}')
+    [[ -n "$ci" && "$ci" != "$ii" ]] && DP_RUN_CMD+=(--stop-signal "$ci")
+    _dp_carry_num --stop-timeout '{{with .Config.StopTimeout}}{{.}}{{end}}'
+    _dp_carry_list --group-add '{{range .HostConfig.GroupAdd}}{{println .}}{{end}}'
+    [[ "$(dinspect '{{with .HostConfig.Init}}{{.}}{{end}}')" == "true" ]] && DP_RUN_CMD+=(--init)
+
+    # Entrypoint / command: only when they differ from the image's own.
+    local ep_c ep_i cmd_c cmd_i first=true
+    ep_c=$(dinspect  '{{range .Config.Entrypoint}}{{println .}}{{end}}')
+    ep_i=$(_dp_iinspect "$image" '{{range .Config.Entrypoint}}{{println .}}{{end}}')
+    cmd_c=$(dinspect '{{range .Config.Cmd}}{{println .}}{{end}}')
+    cmd_i=$(_dp_iinspect "$image" '{{range .Config.Cmd}}{{println .}}{{end}}')
+    if [[ "$ep_c" != "$ep_i" ]]; then
+        # --entrypoint takes only the program; the rest of it goes after the image.
+        while IFS= read -r line; do
+            if $first; then DP_RUN_CMD+=(--entrypoint "$line"); first=false
+            else DP_RUN_TAIL+=("$line"); fi
+        done <<< "$ep_c"
+        $first && DP_RUN_CMD+=(--entrypoint "")
+        while IFS= read -r line; do [[ -n "$line" ]] && DP_RUN_TAIL+=("$line"); done <<< "$cmd_c"
+    elif [[ "$cmd_c" != "$cmd_i" ]]; then
+        while IFS= read -r line; do [[ -n "$line" ]] && DP_RUN_TAIL+=("$line"); done <<< "$cmd_c"
+    fi
+
+    # Labels that aren't the image's own (comm needs both sides sorted). Compose's
+    # own labels are skipped: a container recreated with `docker run` is no longer
+    # Compose-managed, and stale ones would make it claim a project it isn't in.
+    local lbl='{{range $k,$v := .Config.Labels}}{{$k}}={{$v}}{{println}}{{end}}'
+    while IFS= read -r line; do
+        [[ -n "$line" && "$line" != com.docker.compose.* ]] && DP_RUN_CMD+=(--label "$line")
+    done < <(comm -23 <(dinspect "$lbl" | sort) <(_dp_iinspect "$image" "$lbl" | sort))
+
+    # --- Security --------------------------------------------------------
+    [[ "$(dinspect '{{.HostConfig.Privileged}}')" == "true" ]]     && DP_RUN_CMD+=(--privileged)
+    [[ "$(dinspect '{{.HostConfig.ReadonlyRootfs}}')" == "true" ]] && DP_RUN_CMD+=(--read-only)
+    _dp_carry_list --cap-add '{{range .HostConfig.CapAdd}}{{println .}}{{end}}'
+    _dp_carry_list --cap-drop '{{range .HostConfig.CapDrop}}{{println .}}{{end}}'
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        # An inline seccomp profile (JSON) can't be passed back as a flag.
+        if [[ "$line" == seccomp=\{* ]]; then
+            DP_RUN_WARN+=("custom seccomp profile — re-add it with --security-opt seccomp=<profile.json>")
+        else
+            DP_RUN_CMD+=(--security-opt "$line")
+        fi
+    done < <(dinspect '{{range .HostConfig.SecurityOpt}}{{println .}}{{end}}')
+    _dp_carry_list --device '{{range .HostConfig.Devices}}{{.PathOnHost}}:{{.PathInContainer}}:{{.CgroupPermissions}}{{println}}{{end}}'
+
+    # --- Resources / limits ----------------------------------------------
+    _dp_carry_list --ulimit '{{range .HostConfig.Ulimits}}{{.Name}}={{.Soft}}:{{.Hard}}{{println}}{{end}}'
+    _dp_carry_list --sysctl '{{range $k,$v := .HostConfig.Sysctls}}{{$k}}={{$v}}{{println}}{{end}}'
+    _dp_carry_num --pids-limit         '{{with .HostConfig.PidsLimit}}{{.}}{{end}}'
+    _dp_carry_num --cpu-shares         '{{.HostConfig.CpuShares}}'
+    _dp_carry_num --memory-reservation '{{.HostConfig.MemoryReservation}}'
+    v=$(dinspect '{{.HostConfig.ShmSize}}')       # 64 MiB is Docker's own default
+    [[ "$v" =~ ^[0-9]+$ && "$v" -gt 0 && "$v" -ne 67108864 ]] && DP_RUN_CMD+=(--shm-size "$v")
+    v=$(dinspect '{{.HostConfig.CpusetCpus}}')
+    [[ -n "$v" ]] && DP_RUN_CMD+=(--cpuset-cpus "$v")
+    v=$(dinspect '{{.HostConfig.OomScoreAdj}}')
+    [[ "$v" =~ ^-?[0-9]+$ && "$v" -ne 0 ]] && DP_RUN_CMD+=(--oom-score-adj "$v")
+    # Swap: Docker reports 2x memory when none was asked for; only restate a real choice.
+    local mem swap
+    mem=$(dinspect '{{.HostConfig.Memory}}'); swap=$(dinspect '{{.HostConfig.MemorySwap}}')
+    if [[ "$mem" =~ ^[0-9]+$ && "$mem" -gt 0 && "$swap" =~ ^-?[0-9]+$ && "$swap" -ne 0 && "$swap" -ne $((mem * 2)) ]]; then
+        DP_RUN_CMD+=(--memory-swap "$swap")
+    fi
+
+    # --- Logging ---------------------------------------------------------
+    ci=$(dinspect '{{.HostConfig.LogConfig.Type}}'); ii=$(docker info --format '{{.LoggingDriver}}' 2>/dev/null)
+    [[ -n "$ci" && "$ci" != "$ii" ]] && DP_RUN_CMD+=(--log-driver "$ci")
+    _dp_carry_list --log-opt '{{range $k,$v := .HostConfig.LogConfig.Config}}{{$k}}={{$v}}{{println}}{{end}}'
+
+    # --- Things a plain flag can't restore: say so instead of dropping them ---
+    ci=$(dinspect '{{json .Config.Healthcheck}}'); ii=$(_dp_iinspect "$image" '{{json .Config.Healthcheck}}')
+    [[ "$ci" != "$ii" ]] && DP_RUN_WARN+=("custom health check — re-add it with --health-cmd/--health-interval")
+    for v in Ipc Pid UTS Userns; do
+        ci=$(dinspect "{{.HostConfig.${v}Mode}}")
+        case "$ci" in ""|private|shareable) ;; *) DP_RUN_WARN+=("${v} mode '$ci' — add it with --${v,,}") ;; esac
+    done
+    ci=$(dinspect '{{.HostConfig.Runtime}}')
+    case "$ci" in ""|runc) ;; *) DP_RUN_WARN+=("runtime '$ci' — add it with --runtime $ci") ;; esac
+    [[ -n "$(dinspect '{{range .HostConfig.VolumesFrom}}{{println .}}{{end}}')" ]] && \
+        DP_RUN_WARN+=("uses --volumes-from — re-add it by hand")
+    [[ -n "$(dinspect '{{range .HostConfig.Links}}{{println .}}{{end}}')" ]] && \
+        DP_RUN_WARN+=("uses --link — re-add it by hand")
+    [[ "$(dinspect '{{.HostConfig.PublishAllPorts}}')" == "true" ]] && \
+        DP_RUN_WARN+=("published with --publish-all (-P) — add -P by hand")
+    return 0
+}
+
 # Reconstruct the `docker run` argv for the current container, adding extra -p
 # mappings ($@). Sets globals DP_RUN_CMD (array) and DP_ENV_FILE. Env is written
 # to a 0600 --env-file (HOSTNAME dropped so Docker assigns a fresh one) — secrets
@@ -4600,6 +4763,19 @@ _dp_build_run_cmd() {
         DP_RUN_CMD+=(-v "$spec")
     done < <(dinspect '{{range .Mounts}}{{.Type}}|{{.Name}}|{{.Source}}|{{.Destination}}|{{.RW}}{{println}}{{end}}')
 
+    # --tmpfs mounts (e.g. /etc/secrets, which keeps secrets in memory only) are
+    # NOT listed in .Mounts — Docker records them under HostConfig.Tmpfs — so the
+    # loop above silently drops them. Carry them over explicitly, or a recreated
+    # container writes its secrets to the writable layer on disk.
+    local tmpfs_spec
+    while IFS= read -r tmpfs_spec; do
+        [[ -n "$tmpfs_spec" ]] && DP_RUN_CMD+=(--tmpfs "$tmpfs_spec")
+    done < <(dinspect '{{range $p, $o := .HostConfig.Tmpfs}}{{$p}}{{if $o}}:{{$o}}{{end}}{{println}}{{end}}')
+
+    # Everything else a recreate would otherwise reset to defaults.
+    DP_RUN_TAIL=(); DP_RUN_WARN=()
+    _dp_carry_container_settings "$image"
+
     local hip hport cport
     while IFS='|' read -r hip hport cport; do
         [[ -z "$cport" ]] && continue
@@ -4617,6 +4793,159 @@ _dp_build_run_cmd() {
     DP_EXTRA_MOUNTS=()   # consume so a mount never leaks into an unrelated later call
 
     DP_RUN_CMD+=("$image")
+    [[ ${#DP_RUN_TAIL[@]} -gt 0 ]] && DP_RUN_CMD+=("${DP_RUN_TAIL[@]}")
+
+    if [[ ${#DP_RUN_WARN[@]} -gt 0 && "$DP_QUIET" != 1 ]]; then
+        local w
+        log_warn "Settings the recreate can't carry over — add these by hand afterwards:"
+        for w in "${DP_RUN_WARN[@]}"; do echo "      - $w"; done
+    fi
+    return 0
+}
+
+# ------------------------------------------------------------
+#  Saved recipe — how to rebuild this site if the container (or the host) is lost
+# ------------------------------------------------------------
+# A recreate reads the live container, so it's only as good as the container.
+# To rebuild "the same way" once that's gone, every run keeps a replayable copy:
+#   ~/.data-pipeline-doctor/<name>.recipe   the full `docker run` (no secrets inline)
+#   ~/.data-pipeline-doctor/<name>.env      the site env incl. secrets (mode 600)
+# The recipe is retaken whenever the container changes; the 5 previous versions
+# are kept next to it as <name>.recipe.<timestamp>. Compose-managed sites don't
+# need one: their compose file is the recipe.
+DP_RECIPE_ID=""   # id of the container the saved recipe was last taken from
+
+_dp_recipe_dir()  { echo "$HOME/.data-pipeline-doctor"; }
+_dp_recipe_file() { echo "$(_dp_recipe_dir)/${1}.recipe"; }
+_dp_recipe_field() { sed -n "s/^# $2: //p" "$1" | head -1; }   # $1=file $2=field
+
+_dp_snapshot_recipe() {
+    [[ -n "$DOCKER_CONTAINER" ]] && docker inspect "$DOCKER_CONTAINER" >/dev/null 2>&1 || return 1
+    local dir file tmp out="" tok q i w image
+    dir="$(_dp_recipe_dir)"; file="$(_dp_recipe_file "$DOCKER_CONTAINER")"
+    mkdir -p "$dir" 2>/dev/null && chmod 700 "$dir" 2>/dev/null
+    DP_QUIET=1 _dp_build_run_cmd || return 1
+    image=$(dinspect '{{.Config.Image}}')
+    tmp=$(mktemp "$dir/.recipe.XXXXXX") || return 1
+
+    for tok in "${DP_RUN_CMD[@]}"; do
+        q=$(printf '%q' "$tok")
+        if [[ -z "$out" ]]; then out="$q"
+        elif [[ "$tok" == -* ]]; then out+=$' \\\n    '"$q"
+        else out+=" $q"; fi
+    done
+    {
+        echo '#!/usr/bin/env bash'
+        echo "# Data Pipeline Doctor — saved recipe for container '$DOCKER_CONTAINER'."
+        echo "# Rebuilds the site as it was last seen. Secrets are NOT in this file; they are in the env file."
+        echo "# saved: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "# image: $image"
+        echo "# env-file: $DP_ENV_FILE"
+        for ((i = 0; i < ${#DP_RUN_CMD[@]}; i++)); do
+            [[ "${DP_RUN_CMD[$i]}" == "-v" && "${DP_RUN_CMD[$((i+1))]:-}" == /* ]] && \
+                echo "# bind: ${DP_RUN_CMD[$((i+1))]%%:*}"
+        done
+        for w in "${DP_RUN_WARN[@]+"${DP_RUN_WARN[@]}"}"; do echo "# NOT CAPTURED: $w"; done
+        echo "$out"
+    } > "$tmp"
+
+    if [[ -f "$file" ]] && diff -q <(grep -v '^# saved: ' "$file") <(grep -v '^# saved: ' "$tmp") >/dev/null 2>&1; then
+        rm -f "$tmp"; return 0       # nothing changed — keep the existing file and date
+    fi
+    if [[ -f "$file" ]]; then
+        cp -p "$file" "${file}.$(date +%Y%m%d%H%M%S)"
+        local old n=0
+        while IFS= read -r old; do
+            n=$((n + 1)); [[ $n -gt 5 ]] && rm -f "$old"
+        done < <(ls -1t "${file}".[0-9]* 2>/dev/null)
+    fi
+    chmod 600 "$tmp"; mv -f "$tmp" "$file"
+}
+
+# Retake the recipe once per distinct container (a recreate gives a new id).
+_dp_snapshot_if_changed() {
+    local id; id=$(dinspect '{{.Id}}')
+    [[ -n "$id" && "$id" != "$DP_RECIPE_ID" ]] || return 0
+    if ! _dp_compose_info; then _dp_snapshot_recipe || return 0; fi
+    DP_RECIPE_ID="$id"
+    return 0
+}
+
+# Rebuild a site from its saved recipe. $1 = container name.
+docker_rebuild_from_recipe() {
+    local name="$1" file envf image b w out backup=""
+    file="$(_dp_recipe_file "$name")"
+    [[ -f "$file" ]] || { log_err "No saved recipe for '$name' (expected $file)"; return 1; }
+    envf=$(_dp_recipe_field "$file" env-file); image=$(_dp_recipe_field "$file" image)
+
+    if [[ ! -f "$envf" ]]; then
+        log_err "The site env file is missing: $envf"
+        echo "    Download the site's configuration from the console again and save it at that path (chmod 600),"
+        echo "    then re-run — everything else is in the recipe."
+        return 1
+    fi
+    while IFS= read -r w; do
+        [[ -n "$w" ]] && { log_warn "Not captured in the recipe: $w"; }
+    done < <(sed -n 's/^# NOT CAPTURED: //p' "$file")
+
+    # Read the list first: a prompt inside `while read < <(...)` would read from
+    # that pipe instead of the terminal.
+    local binds=()
+    while IFS= read -r b; do [[ -n "$b" ]] && binds+=("$b"); done < <(sed -n 's/^# bind: //p' "$file")
+    for b in "${binds[@]+"${binds[@]}"}"; do
+        [[ -e "$b" ]] && continue
+        log_warn "Mounted path is missing: $b — Docker would create it empty and root-owned, which breaks the site."
+        confirm "Continue anyway?" || return 1
+    done
+
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+        log_info "Pulling $image ..."
+        if ! docker pull "$image" >/dev/null 2>&1; then
+            log_err "Could not pull $image."
+            echo "    Log in to the registry with the token from the site config (it expires), then re-run."
+            return 1
+        fi
+    fi
+    if docker inspect "$name" >/dev/null 2>&1; then
+        log_warn "A container named '$name' already exists."
+        confirm "Stop it and keep it renamed as a backup, then rebuild from the recipe?" || return 1
+        backup="${name}_pre$(date +%s)"
+        docker stop "$name" >/dev/null 2>&1
+        docker rename "$name" "$backup" >/dev/null 2>&1 || { log_err "Could not rename the existing container"; return 1; }
+    fi
+    if out=$(bash "$file" 2>&1); then
+        log_fix "Rebuilt $name from its saved recipe${backup:+ (previous container kept as $backup)}."
+        return 0
+    fi
+    log_err "Rebuild failed:"; echo "$out" | sed 's/^/    /'
+    if [[ -n "$backup" ]]; then
+        docker rm -f "$name" >/dev/null 2>&1
+        docker rename "$backup" "$name" >/dev/null 2>&1 && docker start "$name" >/dev/null 2>&1 && \
+            log_info "Rolled back; the previous container is running again."
+    fi
+    return 1
+}
+
+# No running container: if a saved recipe exists, offer to rebuild before falling
+# back to a brand-new site. Returns 0 = rebuilt (DOCKER_CONTAINER set), 1 = nothing
+# to do / declined, 2 = a rebuild was attempted and failed.
+_dp_offer_recipe_rebuild() {
+    local names=() f name ch
+    for f in "$(_dp_recipe_dir)"/*.recipe; do
+        [[ -f "$f" ]] && names+=("$(basename "$f" .recipe)")
+    done
+    [[ ${#names[@]} -eq 0 ]] && return 1
+    name="${names[0]}"
+    if [[ ${#names[@]} -gt 1 ]]; then
+        ch=$(pick_one "Saved site recipes found — which one do you want to rebuild?" "${names[@]}" "None — set up a new site")
+        [[ "$ch" =~ ^[0-9]+$ && "$ch" -ge 1 && "$ch" -le ${#names[@]} ]] || return 1
+        name="${names[$((ch-1))]}"
+    fi
+    echo ""
+    log_info "No running Data Pipeline container, but a saved recipe exists for '$name' (saved $(_dp_recipe_field "$(_dp_recipe_file "$name")" saved))."
+    confirm_yes "Rebuild it exactly as it was?" || return 1
+    if docker_rebuild_from_recipe "$name"; then DOCKER_CONTAINER="$name"; return 0; fi
+    return 2
 }
 
 # The ports this container currently publishes, with each one's role. Shown at
@@ -6115,10 +6444,16 @@ docker_menu_hec_stream() {
 
 docker_main_menu() {
     while true; do
+        _dp_snapshot_if_changed
         banner
         echo -e "  ${DIM}Container:${NC} $DOCKER_CONTAINER"
         echo -e "  ${DIM}Image:${NC}     $(dinspect '{{.Config.Image}}')"
         echo -e "  ${DIM}Site ID:${NC}   ${OBSERVO_SITE_ID:-unknown}"
+        if _dp_compose_info; then
+            echo -e "  ${DIM}Recipe:${NC}    ${DP_COMPOSE_FILE} ${DIM}(Compose file)${NC}"
+        elif [[ -f "$(_dp_recipe_file "$DOCKER_CONTAINER")" ]]; then
+            echo -e "  ${DIM}Recipe:${NC}    $(_dp_recipe_file "$DOCKER_CONTAINER") ${DIM}(saved $(_dp_recipe_field "$(_dp_recipe_file "$DOCKER_CONTAINER")" saved))${NC}"
+        fi
         echo ""
         echo -e "  ${BOLD}Diagnostics${NC}"
         hr

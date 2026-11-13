@@ -882,10 +882,9 @@ scan_storage() {
 
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
-        local name status vol capacity sc
+        local name status capacity sc
         name=$(echo "$line" | awk '{print $1}')
         status=$(echo "$line" | awk '{print $2}')
-        vol=$(echo "$line" | awk '{print $3}')
         capacity=$(echo "$line" | awk '{print $4}')
         sc=$(echo "$line" | awk '{print $6}')
 
@@ -2782,6 +2781,7 @@ _dpd_run() {
     "$@"
 }
 
+# shellcheck disable=SC2086  # $SUDO is "" or "sudo" and must stay unquoted so an empty value expands to nothing
 dpd_install_debian() {
     local SUDO repo_url codename arch
     SUDO="$(_dpd_sudo)"
@@ -2804,6 +2804,7 @@ dpd_install_debian() {
     _dpd_post_install
 }
 
+# shellcheck disable=SC2086  # $SUDO is "" or "sudo" and must stay unquoted so an empty value expands to nothing
 dpd_install_rhel() {
     local SUDO
     SUDO="$(_dpd_sudo)"
@@ -2823,6 +2824,7 @@ dpd_install_rhel() {
     _dpd_post_install
 }
 
+# shellcheck disable=SC2086  # $SUDO is "" or "sudo" and must stay unquoted so an empty value expands to nothing
 dpd_install_fedora() {
     local SUDO
     SUDO="$(_dpd_sudo)"
@@ -2842,6 +2844,7 @@ dpd_install_fedora() {
     _dpd_post_install
 }
 
+# shellcheck disable=SC2086  # $SUDO is "" or "sudo" and must stay unquoted so an empty value expands to nothing
 dpd_install_amazon() {
     local SUDO
     SUDO="$(_dpd_sudo)"
@@ -2863,6 +2866,7 @@ dpd_install_amazon() {
 
 # Enable + start the daemon and add the user to the docker group.
 # Skipped under DPD_INSTALL_TEST (no systemd / unprivileged container).
+# shellcheck disable=SC2086  # $SUDO is "" or "sudo" and must stay unquoted so an empty value expands to nothing
 _dpd_post_install() {
     if [[ -n "${DPD_INSTALL_TEST:-}" ]]; then
         log_info "Test mode: skipping 'systemctl enable --now docker' and group setup."
@@ -2973,7 +2977,9 @@ docker_preflight() {
 docker_load_endpoints() {
     OBSERVO_SITE_ID="$(dk_env OBSERVO_SITE_ID)"
     SITE_TOKEN_FILE_PATH="$(dk_env SITE_TOKEN_FILE_PATH)"
+    # shellcheck disable=SC2034  # intentional state variable, set from the container env (see header)
     GATEWAY_TLS_SECURED="$(dk_env GATEWAY_TLS_SECURED)"
+    # shellcheck disable=SC2034  # intentional state variable, set from the container env (see header)
     API_GATEWAY_ENDPOINT_VAL="$(dk_env API_GATEWAY_ENDPOINT)"
     DOCKER_ENDPOINTS=()
     local env_dump urls dests u hp
@@ -3541,7 +3547,8 @@ docker_fix_wef_checkpoint_store() {
     echo "    SentinelOne for your version before relying on it in production."
     echo ""
 
-    local hostfile="$(_dpd_home)/.data-pipeline-doctor/dataplane-globals.yaml"
+    local hostfile
+    hostfile="$(_dpd_home)/.data-pipeline-doctor/dataplane-globals.yaml"
     echo "    Will write $hostfile:"
     echo -e "      ${DIM}data_dir: /var/observo/data/dataplane${NC}"
     echo -e "      ${DIM}checkpoint:${NC}"
@@ -3577,7 +3584,8 @@ EOF
     _dp_compose_info && compose_file="$DP_COMPOSE_FILE"
 
     if [[ -n "$compose_file" ]]; then
-        local compose_backup="${compose_file}.bak.$(date +%Y%m%d%H%M%S)"
+        local compose_backup
+        compose_backup="${compose_file}.bak.$(date +%Y%m%d%H%M%S)"
         if ! cp "$compose_file" "$compose_backup"; then
             log_err "Could not back up ${compose_file} — aborting."
             return 1
@@ -3596,7 +3604,8 @@ EOF
 
     DP_EXTRA_MOUNTS=("${hostfile}:${mount_dst}:ro")
     _dp_build_run_cmd
-    local backup="${DOCKER_CONTAINER}_pre$(date +%s)"
+    local backup
+    backup="${DOCKER_CONTAINER}_pre$(date +%s)"
     if ! docker stop "$DOCKER_CONTAINER" >/dev/null 2>&1; then
         log_err "Failed to stop container"; return 1
     fi
@@ -4575,7 +4584,8 @@ docker_menu_source_ports() {
                 echo -e "  ${YELLOW}This will stop and recreate ${DOCKER_CONTAINER} (~brief downtime).${NC}"
                 echo -e "  ${DIM}The current container is renamed (not deleted) so you can roll back.${NC}"
                 if ! confirm "Recreate $DOCKER_CONTAINER now with -p ${newmap}?"; then pause; return; fi
-                local backup="${DOCKER_CONTAINER}_pre$(date +%s)"
+                local backup
+                backup="${DOCKER_CONTAINER}_pre$(date +%s)"
                 if ! docker stop "$DOCKER_CONTAINER" >/dev/null 2>&1; then log_err "Failed to stop container"; pause; return; fi
                 if ! docker rename "$DOCKER_CONTAINER" "$backup" >/dev/null 2>&1; then log_err "Failed to rename; container is stopped — start it again with: docker start $DOCKER_CONTAINER"; pause; return; fi
                 if "${DP_RUN_CMD[@]}" >/dev/null 2>&1; then
@@ -4912,7 +4922,8 @@ docker_wef_make_ready() {
         $need_fips && DP_EXTRA_ENV+=("OPENSSL_CONF=/etc/ssl/openssl.cnf.default")
         _dp_build_run_cmd
 
-        local backup="${DOCKER_CONTAINER}_pre$(date +%s)"
+        local backup
+        backup="${DOCKER_CONTAINER}_pre$(date +%s)"
         if ! docker stop "$DOCKER_CONTAINER" >/dev/null 2>&1; then
             log_err "Failed to stop container"; $inline || pause; return 1
         fi
@@ -5258,7 +5269,7 @@ docker_wef_activity() {
     hours="${hours:-24}"
     [[ "$hours" =~ ^[0-9]+$ && "$hours" -gt 0 ]] || hours=24
     echo ""
-    local report section line
+    local report line
     report=$(dk logs "$DOCKER_CONTAINER" --since "${hours}h" 2>&1 | grep -E 'wef::|component_type=wef' | _dp_wef_activity_report)
     while IFS= read -r line; do
         case "$line" in

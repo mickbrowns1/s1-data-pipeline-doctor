@@ -20,8 +20,9 @@ DP_NEW_SITE_WEF=false # set when docker_setup_new_site built this site WEF-ready
 # --- Site type (kubernetes | docker) ---
 SITE_TYPE=""                                     # chosen at startup
 SITE_TYPE_OVERRIDE="${OBSERVO_SITE_TYPE:-}"      # --site-type flag / env override
-DOCKER_CONTAINER=""                              # resolved observo-standalone-site container
-DOCKER_IMAGE_MATCH="observo-standalone-site"     # substring used to find the container
+DOCKER_CONTAINER=""                              # the site container being managed (found by image, whatever it is named)
+DOCKER_IMAGE_MATCH="observo-standalone-site"     # the IMAGE name, used to find the container — not the container's name
+DP_NEW_SITE_NAME="dp-site"                       # name given to a site Doctor creates (what a manual install uses too)
 DOCKER_SVCS=()                                   # cached s6 service names
 DOCKER_ENDPOINTS=()                              # host:port derived from container env
 OBSERVO_SITE_ID=""                               # from container env, for display
@@ -2498,15 +2499,31 @@ docker_setup_new_site() {
     fi
     echo
 
+    # An existing site container — stopped, or named differently (older Doctor builds
+    # called it observo-standalone-site) — no longer collides by name with the new
+    # one, and two containers on one Site ID compete for the site's configuration.
+    local existing_sites
+    existing_sites=$(docker ps -a --format '{{.Names}} ({{.Status}})\t{{.Image}}' 2>/dev/null \
+        | grep "$DOCKER_IMAGE_MATCH" | awk -F'\t' '{print $1}')
+    if [[ -n "$existing_sites" ]]; then
+        log_warn "A Data Pipeline site container already exists on this host:"
+        while IFS= read -r line; do echo "      $line"; done <<< "$existing_sites"
+        echo "    Starting another with the same site credentials makes two instances compete for the site's configuration."
+        if ! confirm "Start a new '${DP_NEW_SITE_NAME}' anyway?"; then
+            log_info "Nothing was started. Remove or restart the existing one first (docker rm <name> / docker start <name>)."
+            return 1
+        fi
+    fi
+
     # Step 5: Start the container
     echo "  Step 5 — Starting the Data Pipeline container..."
     if $use_compose; then
         local compose_file="$user_home/docker-compose-observo.yml"
         cat > "$compose_file" <<COMPOSE
 services:
-  observo-standalone-site:
+  $DP_NEW_SITE_NAME:
     image: $image
-    container_name: observo-standalone-site
+    container_name: $DP_NEW_SITE_NAME
     env_file: $env_file
     tmpfs:
       - /etc/secrets:uid=1000,gid=1000,mode=0700
@@ -2537,7 +2554,7 @@ COMPOSE
             return 1
         fi
         if docker compose -f "$compose_file" up -d >/dev/null 2>&1; then
-            log_ok "Container started via Docker Compose: observo-standalone-site"
+            log_ok "Container started via Docker Compose: $DP_NEW_SITE_NAME"
             echo -e "          Manage with: ${CYAN}docker compose -f $compose_file [up -d|down|logs|restart]${NC}"
         else
             log_err "docker compose up failed. Check: docker compose -f $compose_file logs"
@@ -2555,16 +2572,16 @@ COMPOSE
             docker_flags+=("-v" "$m")
         done
         if docker run -d \
-            --name observo-standalone-site \
+            --name "$DP_NEW_SITE_NAME" \
             --restart unless-stopped \
             --env-file "$env_file" \
             --tmpfs /etc/secrets:uid=1000,gid=1000,mode=0700 \
             -v observo-data:/var/observo/data \
             "${docker_flags[@]+"${docker_flags[@]}"}" \
             "$image" >/dev/null 2>&1; then
-            log_ok "Container started: observo-standalone-site"
+            log_ok "Container started: $DP_NEW_SITE_NAME"
         else
-            log_err "Failed to start container. Check: docker logs observo-standalone-site"
+            log_err "Failed to start container. Check: docker logs $DP_NEW_SITE_NAME"
             return 1
         fi
     fi
@@ -2576,7 +2593,7 @@ COMPOSE
         pause
     fi
 
-    DOCKER_CONTAINER="observo-standalone-site"
+    DOCKER_CONTAINER="$DP_NEW_SITE_NAME"
     return 0
 }
 

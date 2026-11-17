@@ -22,6 +22,19 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/).
   names collided; with a different name that guard would have gone, and two
   containers on one Site ID compete for the site's configuration. The check
   runs before any file is written, and declining starts nothing. (2026-11-17)
+- **Doctor now says plainly when a site was set up with `sudo` and offers to
+  exit.** Run as a normal user against a site whose env or compose file belongs
+  to `root`, it lists those files and says that `docker compose ...` and any fix
+  that edits them will fail with "permission denied", then offers to exit so you
+  can run `sudo ./data-pipeline-doctor.sh --site-type docker` — which hands the
+  files back to you. Before, the only hint was a dim one-line warning, shown only
+  for Compose sites and only when the compose file wasn't writable; it never
+  mentioned the env file (the one that actually breaks `docker compose`) and never
+  offered to exit. Declining continues: scans still work, only fixes that edit
+  those files fail. The warning for a file that is unwritable for another reason
+  is unchanged. `--container NAME` is added to the suggested command only when more
+  than one site container is running, since Doctor otherwise finds the site by its
+  image. (2026-11-17)
 
 ### Fixed
 

@@ -2679,6 +2679,53 @@ _dpd_hand_back_site_files() {
     return 0
 }
 
+# The env/compose files an earlier sudo run left root-owned — one path per line.
+# Only meaningful in a non-root session (as root they are readable anyway).
+_dpd_root_owned_site_files() {
+    local f env_file cands=("$(_dpd_home)/ai-data-pipelines.env")
+    if _dp_compose_info; then
+        cands+=("$DP_COMPOSE_FILE")
+        env_file="$(_dp_compose_env_file "$DP_COMPOSE_FILE")"
+        [[ -n "$env_file" ]] && cands+=("$env_file")
+    fi
+    for f in "${cands[@]}"; do
+        [[ -f "$f" && "$(stat -c %U "$f" 2>/dev/null)" == "root" ]] && printf '%s\n' "$f"
+    done | sort -u
+}
+
+# Not running as root, but the site's files belong to root (it was set up under
+# sudo): say so plainly and offer to exit so the user can re-run with sudo, which
+# hands the files back. Without this the first sign is a bare "permission denied"
+# from `docker compose`, or a fix that fails halfway. Declining is fine — scans
+# still work; only fixes that edit those files fail.
+_dpd_offer_sudo_rerun() {
+    [[ ${EUID:-$(id -u)} -ne 0 ]] || return 0
+    local files=() f cmd
+    while IFS= read -r f; do [[ -n "$f" ]] && files+=("$f"); done < <(_dpd_root_owned_site_files)
+    if [[ ${#files[@]} -gt 0 ]]; then
+        cmd="sudo $0 --site-type docker"
+        # Doctor finds the site by its image, so --container is only needed when
+        # that would be ambiguous (more than one site container is running).
+        [[ -n "$DOCKER_CONTAINER" && "$(docker ps --format '{{.Image}}' 2>/dev/null | grep -c "$DOCKER_IMAGE_MATCH")" -gt 1 ]] \
+            && cmd+=" --container $DOCKER_CONTAINER"
+        echo ""
+        log_warn "This site was set up with sudo, so these files belong to root:"
+        for f in "${files[@]}"; do echo "      $f"; done
+        echo "    As $(id -un), 'docker compose ...' and any fix that edits them fail with \"permission denied\"."
+        echo -e "    Please exit and run Doctor again with sudo — it will hand the files back to you:\n"
+        echo -e "        ${BOLD}${cmd}${NC}\n"
+        confirm_yes "Exit now so you can run it with sudo?" && { echo ""; exit 0; }
+        echo -e "  ${DIM}Continuing as $(id -un): scans work, but fixes that edit those files will fail.${NC}"
+        return 0
+    fi
+    # Not root-owned, but still not writable by this user (some other owner)
+    if _dp_compose_info && [[ ! -w "$DP_COMPOSE_FILE" ]]; then
+        log_warn "Not running as root — $DP_COMPOSE_FILE isn't writable by $(id -un), so fixes that recreate the container will fail."
+        echo -e "  ${DIM}Scans still work. For fixes, re-run with:  sudo $0${NC}"
+    fi
+    return 0
+}
+
 # A small global profile (not per-site) remembering whether this host
 # manages WEF/WEC-forwarding sites, so the startup question is only asked
 # once. Sets WEF_MODE; returns 1 if there's no saved answer yet.
@@ -3007,12 +3054,10 @@ docker_preflight() {
     # under sudo, give them back to the real user (no-op otherwise).
     _dpd_hand_back_site_files
 
-    # Scans work without root (docker group), but every fix that rewrites the
-    # Compose file fails if Doctor created it under sudo. Say so up front.
-    if [[ ${EUID:-$(id -u)} -ne 0 ]] && _dp_compose_info && [[ ! -w "$DP_COMPOSE_FILE" ]]; then
-        log_warn "Not running as root — $DP_COMPOSE_FILE isn't writable by $(id -un), so fixes that recreate the container will fail."
-        echo -e "  ${DIM}Scans still work. For fixes, re-run with:  sudo $0  (that run also hands the file back to you)${NC}"
-    fi
+    # Scans work without root (docker group), but every fix that edits the site's
+    # files fails if Doctor set the site up under sudo. Say so up front, and offer
+    # to exit so the user can re-run with sudo (which hands the files back).
+    _dpd_offer_sudo_rerun
 
     detect_host_ca
     docker_load_endpoints

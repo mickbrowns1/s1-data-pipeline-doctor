@@ -5,6 +5,26 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Make this site WEF-ready could re-own and re-permission a system directory.**
+  The host certificate folder is derived from the TLS paths the console's WEF
+  source is configured with, offered as the default, and then given a recursive
+  `chmod` (directories 755, files 644, keys 600) and `chown -R 1000:1000`, and
+  mounted into the container. A source whose files sit directly under `/etc`
+  (for example `ca_file: /etc/cert.ca`) made that folder `/etc` itself, so
+  pressing Enter re-owned and re-permissioned everything under it: `sudo` stopped
+  working ("`/etc/sudoers` is owned by uid 1000") and `/etc/shadow` became
+  world-readable (640 -> 644). Doctor now refuses to use the filesystem root, a
+  top-level directory (`/etc`, `/usr`, `/var`, `/home` ...), a home directory, or a
+  tree whose ownership and modes matter (`/usr`, `/etc/ssh`, `/etc/ssl`,
+  `/etc/pki`, `/etc/sudoers.d`, `/etc/systemd` ...) as the certificate folder, with
+  symlinks resolved first. It checks the container-side path as soon as it reads it
+  from the console (before any prompt), the host folder you type, and again inside
+  `_dp_wef_fix_cert_perms` itself, and says to point the source at a dedicated
+  folder such as `/etc/s1/wef/` — nothing is changed. The default `/etc/s1/wef`
+  and any dedicated folder work as before. (2026-11-17)
+
 ## [1.7] - 2026-11-13
 
 Everything merged since v1.6 (2026-09-29): the container-recreate and

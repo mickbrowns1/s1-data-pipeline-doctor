@@ -5273,11 +5273,52 @@ EOF
     _dpd_chown_back "$hostfile" "$(dirname "$hostfile")"
 }
 
+# Why a directory must NOT be used as the WEF certificate folder, or "" if it is
+# fine. The certificate folder gets a recursive chmod/chown and is mounted into
+# the container, so it has to be a dedicated folder — never the filesystem root,
+# a top-level directory (/etc, /usr, /var, /home ...), a home directory, or a
+# tree where ownership and modes are load-bearing (/usr, /etc/ssh, /etc/ssl,
+# /etc/sudoers.d, ...). Console sources can point their TLS files straight at
+# /etc (e.g. ca_file: /etc/cert.ca), and the folder is derived from those paths,
+# so this must be checked rather than assumed. $2 = "noresolve" for a path that
+# lives inside the container (symlinks on this host don't apply to it).
+_dp_unsafe_dir_reason() {
+    local d="$1" mode="${2:-}" r depth
+    [[ "$d" == /* ]] || { echo "not an absolute path"; return 0; }
+    if [[ "$mode" == noresolve ]]; then r="$d"; else r="$(readlink -f "$d" 2>/dev/null)"; [[ -n "$r" ]] || r="$d"; fi
+    while [[ "$r" == */ && "$r" != "/" ]]; do r="${r%/}"; done
+    [[ "$r" == "/" ]] && { echo "the filesystem root"; return 0; }
+    depth=$(awk -F/ '{print NF-1}' <<< "$r")
+    (( depth <= 1 )) && { echo "a top-level system directory ($r)"; return 0; }
+    case "$r" in
+        /home/*|/Users/*) [[ "${r#/*/}" != */* ]] && { echo "a home directory ($r)"; return 0; } ;;
+    esac
+    case "$r" in
+        /usr|/usr/*|/bin|/bin/*|/sbin|/sbin/*|/lib|/lib/*|/lib64|/lib64/*|/boot|/boot/*|/dev|/dev/*|/proc|/proc/*|/sys|/sys/*|/run|/run/*)
+            echo "a system directory ($r)"; return 0 ;;
+        /var/lib|/var/log|/var/run|/var/spool|/var/cache|/var/tmp)
+            echo "a system directory ($r)"; return 0 ;;
+        /etc/ssh|/etc/ssh/*|/etc/ssl|/etc/ssl/*|/etc/pki|/etc/pki/*|/etc/pam.d|/etc/pam.d/*|/etc/security|/etc/security/*|/etc/sudoers.d|/etc/sudoers.d/*|/etc/systemd|/etc/systemd/*|/etc/selinux|/etc/selinux/*|/etc/sysconfig|/etc/sysconfig/*|/etc/default|/etc/default/*|/etc/docker|/etc/docker/*)
+            echo "a system directory ($r)"; return 0 ;;
+    esac
+    if [[ "$mode" != noresolve && -n "${HOME:-}" && "$r" == "$(readlink -f "$HOME" 2>/dev/null)" ]]; then
+        echo "your home directory"; return 0
+    fi
+    return 0
+}
+
 # The container runs as uid 1000: it owns the cert files, certs stay
 # world-readable (they're public), and every private key is 600 — not just
 # the first one found. Creates the directory if it doesn't exist yet.
+# Recursive, so it refuses anything but a dedicated folder (see above).
 _dp_wef_fix_cert_perms() {
-    local dir="$1" s
+    local dir="$1" s reason
+    reason="$(_dp_unsafe_dir_reason "$dir")"
+    if [[ -n "$reason" ]]; then
+        log_err "Refusing to change ownership or permissions under $dir — it is ${reason}."
+        echo "    Doctor only manages a dedicated certificate folder (default ${DP_WEF_CERT_DIR_DEFAULT})."
+        return 1
+    fi
     s=$(_dpd_sudo)
     $s mkdir -p "$dir" 2>/dev/null
     $s find "$dir" -type d -exec chmod 755 {} + 2>/dev/null
@@ -5406,11 +5447,26 @@ docker_wef_make_ready() {
     $need_fips && echo "    - Disable FIPS-mode crypto for this site (OPENSSL_CONF=/etc/ssl/openssl.cnf.default) — WEF cannot start with FIPS on"
     echo ""
 
-    local cert_src_dir="" cert_dst_dir=""
+    local cert_src_dir="" cert_dst_dir="" cert_reason=""
     if $need_certs; then
         # Container side: wherever the console source points, else the guide's path.
         if [[ ${#DP_WEF_CERT_PATHS[@]} -gt 0 ]]; then
             cert_dst_dir="$(dirname "${DP_WEF_CERT_PATHS[0]}")"
+        fi
+        # The console can point its TLS files straight at a system directory
+        # (ca_file: /etc/cert.ca). Mounting a folder there, or changing
+        # permissions in it, would damage the container or this host — stop here,
+        # before anything is touched.
+        if [[ -n "$cert_dst_dir" ]]; then
+            cert_reason="$(_dp_unsafe_dir_reason "$cert_dst_dir" noresolve)"
+            if [[ -n "$cert_reason" ]]; then
+                log_err "The console's WEF source expects its certificate files directly in ${cert_dst_dir} inside the container — that is ${cert_reason}."
+                echo "    Doctor won't mount a folder over, or change permissions in, a system directory."
+                echo "    In the console, point the source's certificate, key and CA paths at a dedicated folder, e.g."
+                echo "        ${DP_WEF_CERT_DIR_DEFAULT}/server.crt   ${DP_WEF_CERT_DIR_DEFAULT}/server.key   ${DP_WEF_CERT_DIR_DEFAULT}/ca.crt"
+                echo "    then run Make this site WEF-ready again. Nothing was changed."
+                $inline || pause; return 1
+            fi
         fi
         # Host side defaults to the same path when it exists, so host and
         # container match like in the guide; otherwise the guide's path.
@@ -5422,6 +5478,12 @@ docker_wef_make_ready() {
         cert_src_dir="${cert_src_dir:-$src_default}"
         if [[ ! -d "$cert_src_dir" ]]; then
             log_err "$cert_src_dir is not a directory — copy the certs there first, or enter where they are. Aborting."
+            $inline || pause; return 1
+        fi
+        cert_reason="$(_dp_unsafe_dir_reason "$cert_src_dir")"
+        if [[ -n "$cert_reason" ]]; then
+            log_err "$cert_src_dir is ${cert_reason} — Doctor won't change ownership or permissions there, or mount it."
+            echo "    Put the certificates in a dedicated folder (default ${DP_WEF_CERT_DIR_DEFAULT}) and enter that. Nothing was changed."
             $inline || pause; return 1
         fi
         if [[ -z "$cert_dst_dir" ]]; then
@@ -5453,7 +5515,9 @@ docker_wef_make_ready() {
     local hostfile
     hostfile="$(_dp_wef_checkpoint_file)"
     $need_checkpoint && _dp_wef_write_checkpoint_store "$hostfile"
-    $need_certs && _dp_wef_fix_cert_perms "$cert_src_dir"
+    if $need_certs && ! _dp_wef_fix_cert_perms "$cert_src_dir"; then
+        $inline || pause; return 1
+    fi
 
     if [[ -n "$compose_file" ]]; then
         local stamp compose_backup env_backup=""

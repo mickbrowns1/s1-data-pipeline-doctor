@@ -255,7 +255,8 @@ If your environment uses a corporate proxy, set `HTTPS_PROXY` / `HTTP_PROXY` on 
 # Interactive mode — asks Kubernetes vs Docker at startup
 ./data-pipeline-doctor.sh
 
-# Go straight to a Docker site (auto-detects the observo-standalone-site container)
+# Go straight to a Docker site (auto-detects the site container by its image,
+# observo-standalone-site — whatever the container is named; new sites are named dp-site)
 ./data-pipeline-doctor.sh --site-type docker
 
 # Target a specific container by name

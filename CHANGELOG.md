@@ -5,6 +5,24 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+
+- **A site created by New Site Setup is now named `dp-site`** — the name a manual
+  install uses (`docker run --name dp-site ...`) — instead of
+  `observo-standalone-site`. This is the container's name only: the Compose
+  service and `container_name`, the `docker run --name`, and the messages. The
+  image is still `observo-standalone-site` and Doctor still finds a site by that
+  image, so a container with any name is detected and managed as before, and an
+  existing `observo-standalone-site` site keeps working untouched. The volume
+  (`observo-data`) and the `docker-compose-observo.yml` / `ai-data-pipelines.env`
+  file names are unchanged. (2026-11-17)
+- New Site Setup now asks before starting a new site when a Data Pipeline site
+  container (running or stopped, any name) already exists on the host. Before,
+  an old stopped `observo-standalone-site` blocked a new one only because the
+  names collided; with a different name that guard would have gone, and two
+  containers on one Site ID compete for the site's configuration. The check
+  runs before any file is written, and declining starts nothing. (2026-11-17)
+
 ### Fixed
 
 - **Make this site WEF-ready could re-own and re-permission a system directory.**

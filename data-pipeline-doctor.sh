@@ -5312,9 +5312,11 @@ docker_wef_menu_readiness() {
 # Compose-sync / raw-run-recreate pattern as the other fixes. The cert
 # source directory on the host isn't guessable — Doctor asks for it rather
 # than assuming a path.
-# Path the vendor WEF guide uses for the server cert, key and CA. Absent from
-# the 2.46.0 image, so mounting here can't shadow anything the site ships.
-DP_WEF_CERT_DIR_DEFAULT="/etc/s1/wef"
+# The standard folder for the server cert, key and CA — any file names. Absent
+# from the 2.46.0 image, so mounting here can't shadow anything the site ships.
+# Sites set up earlier may use /etc/s1/wef (the old default): Doctor reads the
+# real paths from the console config, so those keep working unchanged.
+DP_WEF_CERT_DIR_DEFAULT="/etc/datapipeline/certs"
 DP_WEF_PORT_DEFAULT=5986
 
 # Host-side checkpoint store for the WEF source, mounted at
@@ -5401,27 +5403,84 @@ _dp_env_set_openssl_conf() {
     fi
 }
 
+# Classify what is in a certificate folder, BY NAME, as a suggestion only — nothing
+# is ever changed on the strength of it. Certificate files come with any names, so
+# this just recognises the usual patterns. Prints "role|path" lines, role = ca, crt
+# or key (the first match of each, in name order).
+_dp_wef_guess_certs() {
+    local dir="$1" f b lc ca_re='(^|[-_.])ca([-_.]|$)' have_ca="" have_crt="" have_key=""
+    [[ -d "$dir" ]] || return 0
+    for f in "$dir"/*; do
+        [[ -f "$f" ]] || continue
+        b="$(basename "$f")"; lc="$(tr '[:upper:]' '[:lower:]' <<< "$b")"
+        case "$lc" in
+            *.p12|*.pfx|*.jks|*.csr|*.srl|*.cnf|*.txt|*.md|*.sh|*.ps1) continue ;;   # not a PEM cert or key
+            *.key|*key*.pem)
+                [[ -z "$have_key" ]] && { echo "key|$f"; have_key=1; } ;;
+            *.crt|*.pem|*.cer|*.cert|*.ca)
+                if [[ "$lc" =~ $ca_re || "$lc" == *root* || "$lc" == *chain* ]]; then
+                    [[ -z "$have_ca" ]] && { echo "ca|$f"; have_ca=1; }
+                else
+                    [[ -z "$have_crt" ]] && { echo "crt|$f"; have_crt=1; }
+                fi ;;
+        esac
+    done
+}
+
+# Get from "the console points at the wrong place" (or "the folder isn't there yet")
+# to a working setup in one pass. $1 = the certificate folder, $2 = "yes" to offer to
+# create it. If it already holds files, say what to enter in the console (guessed from
+# the names — check them); if it is missing, offer to create it ready for them.
+_dp_wef_cert_dir_help() {
+    local dir="$1" offer="${2:-yes}" guess role path lbl
+    guess="$(_dp_wef_guess_certs "$dir")"
+    if [[ -n "$guess" ]]; then
+        echo -e "  ${BOLD}Files already in ${dir}${NC} — in the console, set the WEF source's paths to:"
+        for role in ca crt key; do
+            path="$(grep "^${role}|" <<< "$guess" | head -1 | cut -d'|' -f2)"
+            case "$role" in ca) lbl="ca_file:";; crt) lbl="crt_file:";; *) lbl="key_file:";; esac
+            printf '        %-10s %s\n' "$lbl" "${path:-<copy the ${role} file into ${dir} first>}"
+        done
+        echo -e "  ${DIM}(guessed from the file names — check them)${NC}"
+    elif [[ -d "$dir" ]]; then
+        echo "  ${dir} exists but is empty. Copy your CA certificate, server certificate and private key"
+        echo "  into it (any file names)."
+    elif [[ "$offer" == yes ]] && confirm_yes "Create ${dir} now (owned by the container user) so you can copy your files into it?"; then
+        if _dp_wef_fix_cert_perms "$dir" && [[ -d "$dir" ]]; then
+            log_ok "Created ${dir}. Copy your CA certificate, server certificate and private key into it (any file names)."
+        fi
+    else
+        echo "  Create it with:  sudo mkdir -p ${dir} && sudo chown 1000:1000 ${dir}"
+    fi
+    echo "  Then point the console source at files in ${dir} and run Make this site WEF-ready again."
+}
+
 # Shown at the end of new-site setup in WEF/WEC mode: the steps Doctor
 # can't do for the customer (their certs, the console source).
 _dp_wef_print_next_steps() {
-    local port="$1" cert_dir="$2" fqdn f missing=()
+    local port="$1" cert_dir="$2" fqdn guess role path lbl human
     fqdn="$(hostname -f 2>/dev/null || hostname)"
-    for f in ca.crt server.crt server.key; do
-        $(_dpd_sudo) test -f "$cert_dir/$f" 2>/dev/null || missing+=("$f")
-    done
+    guess="$(_dp_wef_guess_certs "$cert_dir")"
     echo -e "  ${BOLD}WEF/WEC — next steps${NC}"
     echo ""
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        echo "    1. Copy the server certificate, key, and CA into ${cert_dir}:"
-        echo "         ${missing[*]}"
-        echo "       Then re-run Doctor (or Tools 17 → 2) to set ownership for the container."
+    if [[ -z "$guess" ]]; then
+        echo "    1. Copy the server certificate, its private key and the CA certificate into ${cert_dir}"
+        echo "       (any file names). Then re-run Doctor (or Tools 17 → 2) to set ownership for the container."
     else
-        echo "    1. Certificates found in ${cert_dir} — ownership set for the container."
+        echo "    1. Files found in ${cert_dir} — ownership set for the container."
     fi
     echo "    2. In the console, add a Windows Event Forwarding source to this site:"
     echo "         Listen address:     0.0.0.0:${port}"
     echo "         Collector address:  ${fqdn}:${port}   (the name Windows forwarders resolve)"
-    echo "         CA / cert / key:    ${cert_dir}/ca.crt, ${cert_dir}/server.crt, ${cert_dir}/server.key"
+    for role in ca crt key; do
+        path="$(grep "^${role}|" <<< "$guess" | head -1 | cut -d'|' -f2)"
+        case "$role" in
+            ca)  lbl="CA file:";           human="CA" ;;
+            crt) lbl="Certificate file:";  human="server certificate" ;;
+            *)   lbl="Private key file:";  human="private key" ;;
+        esac
+        printf '         %-20s%s\n' "$lbl" "${path:-${cert_dir}/<your ${human} file>}"
+    done
     echo "    3. Point the Windows subscription manager at:"
     echo "         Server=https://${fqdn}:${port}/wsman/SubscriptionManager/WEC,Refresh=60,IssuerCA=<CA thumbprint>"
     echo "    4. Check it with Tools 17 → 1 (readiness check) once the source is deployed."
@@ -5524,9 +5583,10 @@ docker_wef_make_ready() {
             if [[ -n "$cert_reason" ]]; then
                 log_err "The console's WEF source expects its certificate files directly in ${cert_dst_dir} inside the container — that is ${cert_reason}."
                 echo "    Doctor won't mount a folder over, or change permissions in, a system directory."
-                echo "    In the console, point the source's certificate, key and CA paths at a dedicated folder, e.g."
-                echo "        ${DP_WEF_CERT_DIR_DEFAULT}/server.crt   ${DP_WEF_CERT_DIR_DEFAULT}/server.key   ${DP_WEF_CERT_DIR_DEFAULT}/ca.crt"
-                echo "    then run Make this site WEF-ready again. Nothing was changed."
+                echo "    Use a dedicated folder — the standard one is ${DP_WEF_CERT_DIR_DEFAULT} — and point the source's"
+                echo "    certificate, key and CA paths at files in it (any file names)."
+                echo ""
+                if $inline; then _dp_wef_cert_dir_help "$DP_WEF_CERT_DIR_DEFAULT" no; else _dp_wef_cert_dir_help "$DP_WEF_CERT_DIR_DEFAULT" yes; fi
                 $inline || pause; return 1
             fi
         fi
@@ -5539,7 +5599,15 @@ docker_wef_make_ready() {
         read -rp "  Host cert directory [${src_default}]: " cert_src_dir || _dpd_eof_exit
         cert_src_dir="${cert_src_dir:-$src_default}"
         if [[ ! -d "$cert_src_dir" ]]; then
-            log_err "$cert_src_dir is not a directory — copy the certs there first, or enter where they are. Aborting."
+            log_err "$cert_src_dir is not a directory yet."
+            cert_reason="$(_dp_unsafe_dir_reason "$cert_src_dir")"
+            if [[ -n "$cert_reason" ]]; then
+                echo "    It would be ${cert_reason}. Use a dedicated folder — the standard one is ${DP_WEF_CERT_DIR_DEFAULT} — and enter that."
+            elif $inline; then
+                _dp_wef_cert_dir_help "$cert_src_dir" no
+            else
+                _dp_wef_cert_dir_help "$cert_src_dir" yes
+            fi
             $inline || pause; return 1
         fi
         cert_reason="$(_dp_unsafe_dir_reason "$cert_src_dir")"

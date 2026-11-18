@@ -54,6 +54,16 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/).
   than one site container is running, since Doctor otherwise finds the site by its
   image. (2026-11-17)
 
+- **Install guide Rev. 7** (`DPM-DR Installv7.pdf`, replacing Rev. 6). New sites are
+  named `dp-site` throughout (commands, headings, the rollback), with a note that older
+  sites keep `observo-standalone-site` and that Doctor finds a site by its image. It
+  documents the existing-site-container prompt, the rule that the WEF certificate
+  folder must be a dedicated folder (with a troubleshooting row for the `/etc`
+  refusal), and the "set up with sudo — please re-run with sudo" prompt. The standard
+  WEF certificate folder is now `/etc/datapipeline/certs` (any file names), with a note
+  on what Doctor does when the console points at a system directory or the folder
+  doesn't exist yet. The WEF example output headings show `dp-site`. (2026-11-18)
+
 ### Fixed
 
 - **Make this site WEF-ready could re-own and re-permission a system directory.**

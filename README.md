@@ -133,7 +133,7 @@ A self-hosted site receives source data on **published container ports** (Syslog
 
 At startup, on a Docker site the tool asks once whether this host manages Windows Event Forwarding (WEF/WEC) sites, and remembers the answer (`~/.data-pipeline-doctor/profile`). When it's on, the Full diagnostic scan adds a read-only WEF readiness section, and the Docker menu's option 17 shows a live issue count.
 
-Answering yes also changes **New Site Setup**: before the container starts, it asks for the WEF listener port (default `5986`), creates and mounts a certificate directory (default `/etc/s1/wef`, read-only, owned by uid 1000), writes the checkpoint store, and offers to disable FIPS-mode crypto — so a fresh site comes up WEF-ready on the first start, no later recreate needed.
+Answering yes also changes **New Site Setup**: before the container starts, it asks for the WEF listener port (default `5986`), creates and mounts a certificate directory (default `/etc/datapipeline/certs`, read-only, owned by uid 1000), writes the checkpoint store, and offers to disable FIPS-mode crypto — so a fresh site comes up WEF-ready on the first start, no later recreate needed.
 
 Option **17 → WEF/WEC integration**:
 

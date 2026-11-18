@@ -7,6 +7,24 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- **The standard WEF certificate folder is now `/etc/datapipeline/certs`** (was
+  `/etc/s1/wef`), and Doctor no longer assumes certificate *file names*. Certificate
+  files come with any names, so New Site Setup's "next steps" and the Make-ready
+  prompts now look at what is actually in the folder (recognising the usual patterns:
+  `ca.crt`/`rootCA.pem`/`my-ca.cer`, `server.crt`/`localhost.pem`, `*.key`/`*-key.pem`;
+  `.pfx`, `.p12` and text files are ignored) and suggest the values to enter in the
+  console, instead of listing `ca.crt` / `server.crt` / `server.key` as "missing".
+  The guess is a suggestion only; nothing is changed on the strength of it. Sites
+  that already use `/etc/s1/wef` (or any other folder) are unaffected: Doctor reads
+  the real paths from the console's source config.
+- **When the console points the source at a system directory** (for example
+  `ca_file: /etc/cert.ca`), Make-ready still refuses to touch it, but no longer
+  leaves you to work out the rest: it names the standard folder, shows the console
+  paths to use if that folder already holds files, and otherwise offers to create the
+  folder now (owned by the container user, nothing else changed) so you can copy your
+  files in and run it again. The same applies when the host folder you type doesn't
+  exist yet, which used to abort with "not a directory". In the full scan's fix pass it
+  only prints the hint — no prompt. (2026-11-18)
 - **A site created by New Site Setup is now named `dp-site`** — the name a manual
   install uses (`docker run --name dp-site ...`) — instead of
   `observo-standalone-site`. This is the container's name only: the Compose

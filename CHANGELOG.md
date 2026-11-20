@@ -54,6 +54,15 @@ loosely follows [Keep a Changelog](https://keepachangelog.com/).
   than one site container is running, since Doctor otherwise finds the site by its
   image. (2026-11-17)
 
+- **Install guide Rev. 8** (`DPM-DR Installv8.pdf`, replacing Rev. 7). The guide is
+  restructured as the current install guide: the body describes how a new site is built
+  today, and everything about older builds moved to a new closing section, *Updating to
+  the latest version*. That section covers updating Doctor, a table of what differs on a
+  site an older build created (container name, file ownership under `sudo`, restart
+  policy, Syslog port mapping, WEF certificate folder, env-file hand-off, saved recipe,
+  Source ports), the `/etc` check for sites that ran an older Make-ready, and a revision
+  history. The WEF example output uses the standard certificate folder. (2026-11-18)
+
 - **Install guide Rev. 7** (`DPM-DR Installv7.pdf`, replacing Rev. 6). New sites are
   named `dp-site` throughout (commands, headings, the rollback), with a note that older
   sites keep `observo-standalone-site` and that Doctor finds a site by its image. It
